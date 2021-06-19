@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: saltcorn-data/models/view.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: saltcorn-data/models/view.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>/**
+ *
+ * View Data Access Layer
+ */
+
+const db = require("../db");
+const Form = require("../models/form");
+const { contract, is } = require("contractis");
+const { fieldlike, is_viewtemplate, is_tablely } = require("../contracts");
+const {
+  removeEmptyStrings,
+  numberToBool,
+  stringToJSON,
+  InvalidConfiguration,
+  satisfies,
+  structuredClone,
+} = require("../utils");
+const { remove_from_menu } = require("./config");
+const { div } = require("@saltcorn/markup/tags");
+const { renderForm } = require("@saltcorn/markup");
+
+/**
+ * View Class
+ */
+class View {
+  constructor(o) {
+    this.name = o.name;
+    this.id = o.id;
+    this.viewtemplate = o.viewtemplate;
+    this.exttable_name = o.exttable_name;
+    this.description = o.description;
+    if (o.table_id) this.table_id = o.table_id;
+    if (o.table &amp;&amp; !o.table_id) {
+      this.table_id = o.table.id;
+    }
+    if (o.table_name) this.table_name = o.table_name;
+    this.configuration = stringToJSON(o.configuration);
+    this.min_role =
+      !o.min_role &amp;&amp; typeof o.is_public !== "undefined"
+        ? o.is_public
+          ? 10
+          : 8
+        : +o.min_role;
+    const { getState } = require("../db/state");
+    this.viewtemplateObj = getState().viewtemplates[this.viewtemplate];
+    this.default_render_page = o.default_render_page;
+    contract.class(this);
+  }
+  static findOne(where) {
+    const { getState } = require("../db/state");
+    const v = getState().views.find(
+      where.id
+        ? (v) => v.id === +where.id
+        : where.name
+        ? (v) => v.name === where.name
+        : satisfies(where)
+    );
+    return v
+      ? new View({ ...v, configuration: structuredClone(v.configuration) })
+      : v;
+  }
+
+  /**
+   *
+   * @param where
+   * @param selectopts
+   * @returns {Promise&lt;*>}
+   */
+  static async find(where, selectopts = { orderBy: "name", nocase: true }) {
+    const views = await db.select("_sc_views", where, selectopts);
+
+    return views.map((v) => new View(v));
+  }
+
+  /**
+   *
+   * @returns {Promise&lt;*|*[]>}
+   */
+  async get_state_fields() {
+    if (this.viewtemplateObj.get_state_fields) {
+      return await this.viewtemplateObj.get_state_fields(
+        this.table_id,
+        this.name,
+        this.configuration
+      );
+    } else return [];
+  }
+
+  /**
+   * Get menu label
+   * @returns {*|undefined}
+   */
+  get menu_label() {
+    const { getState } = require("../db/state");
+    const menu_items = getState().getConfig("menu_items", []);
+    const item = menu_items.find((mi) => mi.viewname === this.name);
+    return item ? item.label : undefined;
+  }
+
+  /**
+   *
+   * @param table
+   * @param pred
+   * @returns {Promise&lt;*[]>}
+   */
+  static async find_table_views_where(table, pred) {
+    var link_view_opts = [];
+    const link_views = await View.find(
+      table.id
+        ? {
+            table_id: table.id,
+          }
+        : table.name
+        ? { exttable_name: table.name }
+        : typeof table === "string"
+        ? { exttable_name: table }
+        : { table_id: table },
+      { orderBy: "name", nocase: true }
+    );
+
+    for (const viewrow of link_views) {
+      // may fail if incomplete view
+      const sfs = await viewrow.get_state_fields();
+      if (
+        pred({
+          viewrow,
+          viewtemplate: viewrow.viewtemplateObj,
+          state_fields: sfs,
+        })
+      )
+        link_view_opts.push(viewrow);
+    }
+    return link_view_opts;
+  }
+
+  get select_option() {
+    return {
+      name: this.name,
+      label: `${this.name} [${this.viewtemplate}${
+        this.table
+          ? ` ${this.table.name}`
+          : this.table_name
+          ? ` ${this.table_name}`
+          : ""
+      }]`,
+    };
+  }
+
+  static async find_all_views_where(pred) {
+    var link_view_opts = [];
+    const link_views = await View.find({}, { orderBy: "name", nocase: true });
+
+    for (const viewrow of link_views) {
+      // may fail if incomplete view
+      const sfs = await viewrow.get_state_fields();
+      if (
+        pred({
+          viewrow,
+          viewtemplate: viewrow.viewtemplateObj,
+          state_fields: sfs,
+        })
+      )
+        link_view_opts.push(viewrow);
+    }
+    return link_view_opts;
+  }
+
+  static async find_possible_links_to_table(table) {
+    return View.find_table_views_where(table, ({ state_fields }) =>
+      state_fields.some((sf) => sf.name === "id" || sf.primary_key)
+    );
+  }
+
+  /**
+   * Create view in database
+   * @param v
+   * @returns {Promise&lt;View>}
+   */
+  // todo there hard code about roles and flag is_public
+  static async create(v) {
+    // is_public flag processing
+    if (!v.min_role &amp;&amp; typeof v.is_public !== "undefined") {
+      v.min_role = v.is_public ? 10 : 8;
+      delete v.is_public;
+    }
+    // insert view defintion into _sc_views
+    const id = await db.insert("_sc_views", v);
+    // refresh views list cache
+    await require("../db/state").getState().refresh_views();
+    return new View({ id, ...v });
+  }
+
+  /**
+   * Clone View
+   * @returns {Promise&lt;View>}
+   */
+  async clone() {
+    const basename = this.name + " copy";
+    let newname;
+    // todo there is hard code linmitation about 100 copies of veiew
+    for (let i = 0; i &lt; 100; i++) {
+      newname = i ? `${basename} (${i})` : basename;
+      const existing = await View.findOne({ name: newname });
+      if (!existing) break;
+    }
+    const createObj = {
+      ...this,
+      name: newname,
+    };
+    delete createObj.viewtemplateObj;
+    delete createObj.id;
+    return await View.create(createObj);
+  }
+
+  /**
+   * Delete current view from db
+   * @returns {Promise&lt;void>}
+   */
+  async delete() {
+    if (this.viewtemplateObj &amp;&amp; this.viewtemplateObj.on_delete)
+      await this.viewtemplateObj.on_delete(
+        this.table_id,
+        this.name,
+        this.configuration
+      );
+    // delete view from _sc_view
+    await db.deleteWhere("_sc_views", { id: this.id });
+    // remove view from menu
+    await remove_from_menu({ name: this.name, type: "View" });
+    // fresh view list cache
+    await require("../db/state").getState().refresh_views();
+  }
+
+  /**
+   * Delete list of views
+   * @param where - condition
+   * @returns {Promise&lt;void>}
+   */
+  static async delete(where) {
+    const vs = await View.find(where);
+    for (const v of vs) await v.delete();
+  }
+
+  /**
+   * Update View description
+   * @param v - view name
+   * @param id - id
+   * @returns {Promise&lt;void>}
+   */
+  static async update(v, id) {
+    // update view description
+    await db.update("_sc_views", v, id);
+    // fresh view list cache
+    await require("../db/state").getState().refresh_views();
+  }
+
+  async authorise_post(arg) {
+    if (!this.viewtemplateObj.authorise_post) return false;
+    return await this.viewtemplateObj.authorise_post(arg);
+  }
+  async authorise_get(arg) {
+    if (!this.viewtemplateObj.authorise_get) return false;
+    return await this.viewtemplateObj.authorise_get(arg);
+  }
+
+  /**
+   * Run (Execute) View
+   * @param query
+   * @param extraArgs
+   * @returns {Promise&lt;*>}
+   */
+  async run(query, extraArgs) {
+    return await this.viewtemplateObj.run(
+      this.exttable_name || this.table_id,
+      this.name,
+      this.configuration,
+      removeEmptyStrings(query),
+      extraArgs
+    );
+  }
+
+  async run_possibly_on_page(query, req, res) {
+    const view = this;
+    if (view.default_render_page &amp;&amp; (!req.xhr || req.headers.pjaxpageload)) {
+      const Page = require("../models/page");
+      const db_page = await Page.findOne({ name: view.default_render_page });
+      if (db_page) {
+        const contents = await db_page.run(query, { res, req });
+        return contents;
+      }
+    }
+    const state = view.combine_state_and_default_state(query);
+    const resp = await view.run(state, { res, req });
+    const state_form = await view.get_state_form(state, req);
+    const contents = div(
+      state_form ? renderForm(state_form, req.csrfToken()) : "",
+      resp
+    );
+    return contents;
+  }
+
+  async runMany(query, extraArgs) {
+    if (this.viewtemplateObj.runMany)
+      return await this.viewtemplateObj.runMany(
+        this.table_id,
+        this.name,
+        this.configuration,
+        query,
+        extraArgs
+      );
+    if (this.viewtemplateObj.renderRows) {
+      const Table = require("./table");
+      const { stateFieldsToWhere } = require("../plugin-helper");
+
+      const tbl = await Table.findOne({ id: this.table_id });
+      const fields = await tbl.getFields();
+      const qstate = await stateFieldsToWhere({ fields, state: query });
+      const rows = await tbl.getRows(qstate);
+      const rendered = await this.viewtemplateObj.renderRows(
+        tbl,
+        this.name,
+        this.configuration,
+        extraArgs,
+        rows
+      );
+
+      return rendered.map((html, ix) => ({ html, row: rows[ix] }));
+    }
+
+    throw new InvalidConfiguration(
+      `runMany on view ${this.name}: viewtemplate ${this.viewtemplate} does not have renderRows or runMany methods`
+    );
+  }
+  async runPost(query, body, extraArgs) {
+    return await this.viewtemplateObj.runPost(
+      this.table_id,
+      this.name,
+      this.configuration,
+      removeEmptyStrings(query),
+      removeEmptyStrings(body),
+      extraArgs
+    );
+  }
+
+  async runRoute(route, body, res, extraArgs) {
+    const result = await this.viewtemplateObj.routes[route](
+      this.table_id,
+      this.name,
+      this.configuration,
+      body,
+      extraArgs
+    );
+    if (result &amp;&amp; result.json) res.json(result.json);
+    else if (result &amp;&amp; result.html) res.send(result.html);
+    else res.json({ success: "ok" });
+  }
+
+  combine_state_and_default_state(req_query) {
+    var state = { ...req_query };
+    const defstate = this.viewtemplateObj.default_state_form
+      ? this.viewtemplateObj.default_state_form(this.configuration)
+      : {};
+
+    Object.entries(defstate || {}).forEach(([k, v]) => {
+      if (!state[k]) {
+        state[k] = v;
+      }
+    });
+    return state;
+  }
+  async get_state_form(query, req) {
+    const vt_display_state_form = this.viewtemplateObj.display_state_form;
+    const display_state_form =
+      typeof vt_display_state_form === "function"
+        ? vt_display_state_form(this.configuration)
+        : vt_display_state_form;
+    if (display_state_form) {
+      const fields = await this.get_state_fields();
+
+      fields.forEach((f) => {
+        f.required = false;
+        if (f.label === "Anywhere" &amp;&amp; f.name === "_fts")
+          f.label = req.__(f.label);
+        if (f.type &amp;&amp; f.type.name === "Bool") f.fieldview = "tristate";
+        if (f.type &amp;&amp; f.type.read &amp;&amp; typeof query[f.name] !== "undefined") {
+          query[f.name] = f.type.read(query[f.name]);
+        }
+      });
+      const form = new Form({
+        methodGET: true,
+        action: `/view/${encodeURIComponent(this.name)}`,
+        fields,
+        submitLabel: req.__("Apply"),
+        isStateForm: true,
+        __: req.__,
+        values: removeEmptyStrings(query),
+      });
+      await form.fill_fkey_options(true);
+      return form;
+    } else return null;
+  }
+
+  async get_config_flow(req) {
+    const configFlow = this.viewtemplateObj.configuration_workflow(req);
+    configFlow.action = `/viewedit/config/${encodeURIComponent(this.name)}`;
+    const oldOnDone = configFlow.onDone || ((c) => c);
+    configFlow.onDone = async (ctx) => {
+      const { table_id, ...configuration } = await oldOnDone(ctx);
+
+      await View.update({ configuration }, this.id);
+      return {
+        redirect: `/viewedit`,
+        flash: ["success", `View ${this.name || ""} saved`],
+      };
+    };
+    return configFlow;
+  }
+}
+
+View.contract = {
+  variables: {
+    name: is.str,
+    id: is.maybe(is.posint),
+    table_id: is.maybe(is.posint),
+    viewtemplate: is.str,
+    min_role: is.posint,
+    viewtemplateObj: is.maybe(is_viewtemplate),
+    default_render_page: is.maybe(is.str),
+  },
+  methods: {
+    get_state_fields: is.fun([], is.promise(is.array(fieldlike))),
+    get_state_form: is.fun(
+      [is.obj(), is.obj({ __: is.fun(is.str, is.str) })],
+      is.promise(is.maybe(is.class("Form")))
+    ),
+    get_config_flow: is.fun(
+      is.obj({ __: is.fun(is.str, is.str) }),
+      is.promise(is.class("Workflow"))
+    ),
+    delete: is.fun([], is.promise(is.undefined)),
+    menu_label: is.getter(is.maybe(is.str)),
+    run: is.fun(
+      [is.obj(), is.obj({ req: is.defined, res: is.defined })],
+      is.promise(is.any)
+    ),
+    runPost: is.fun(
+      [is.obj(), is.obj(), is.obj({ req: is.defined, res: is.defined })],
+      is.promise(is.any)
+    ),
+    runRoute: is.fun(
+      [
+        is.str,
+        is.obj(),
+        is.obj(),
+        is.obj({ req: is.defined, res: is.defined }),
+      ],
+      is.promise(is.any)
+    ),
+    runMany: is.fun(
+      [is.obj(), is.obj({ req: is.defined, res: is.defined })],
+      is.promise(is.array(is.obj({ html: is.defined, row: is.obj() })))
+    ),
+    combine_state_and_default_state: is.fun(is.obj(), is.obj()),
+  },
+  static_methods: {
+    find: is.fun(
+      [is.maybe(is.obj()), is.maybe(is.obj())],
+      is.promise(is.array(is.class("View")))
+    ),
+    findOne: is.fun(is.obj(), is.maybe(is.class("View"))),
+    create: is.fun(
+      is.obj({
+        name: is.str,
+        table_id: is.maybe(is.posint),
+        viewtemplate: is.str,
+      }),
+      is.promise(is.class("View"))
+    ),
+    update: is.fun([is.obj(), is.posint], is.promise(is.undefined)),
+    delete: is.fun(is.obj(), is.promise(is.undefined)),
+
+    find_possible_links_to_table: is.fun(
+      is.or(is.posint, is_tablely, is.str),
+      is.promise(is.array(is.class("View")))
+    ),
+    find_all_views_where: is.fun(
+      is.fun(
+        is.obj({
+          viewrow: is.class("View"),
+          viewtemplate: is.obj(),
+          state_fields: is.array(fieldlike),
+        }),
+        is.bool
+      ),
+      is.promise(is.array(is.class("View")))
+    ),
+    find_table_views_where: is.fun(
+      [
+        is.or(is.posint, is_tablely, is.str),
+        is.fun(
+          is.obj({
+            viewrow: is.class("View"),
+            viewtemplate: is.obj(),
+            state_fields: is.array(fieldlike),
+          }),
+          is.bool
+        ),
+      ],
+      is.promise(is.array(is.class("View")))
+    ),
+  },
+};
+module.exports = View;
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Classes</h3><ul><li><a href="Field.html">Field</a></li><li><a href="File.html">File</a></li><li><a href="Page.html">Page</a></li><li><a href="Plugin.html">Plugin</a></li><li><a href="PluginsCommand.html">PluginsCommand</a></li><li><a href="State.html">State</a></li><li><a href="Table.html">Table</a></li><li><a href="Trigger.html">Trigger</a></li><li><a href="User.html">User</a></li><li><a href="global.html#View">View</a></li></ul><h3>Global</h3><ul><li><a href="global.html#add_unique_constraint">add_unique_constraint</a></li><li><a href="global.html#addOrCreateList">addOrCreateList</a></li><li><a href="global.html#bool">bool</a></li><li><a href="global.html#calcfldViewConfig">calcfldViewConfig</a></li><li><a href="global.html#calcfldViewOptions">calcfldViewOptions</a></li><li><a href="global.html#changeConnection">changeConnection</a></li><li><a href="global.html#check_email_mask">check_email_mask</a></li><li><a href="global.html#close">close</a></li><li><a href="global.html#color">color</a></li><li><a href="global.html#configFileDir">configFileDir</a></li><li><a href="global.html#configFilePath">configFilePath</a></li><li><a href="global.html#configTypes">configTypes</a></li><li><a href="global.html#constraintForm">constraintForm</a></li><li><a href="global.html#copyFrom">copyFrom</a></li><li><a href="global.html#copyFrom1">copyFrom1</a></li><li><a href="global.html#count">count</a></li><li><a href="global.html#create_blank_migration">create_blank_migration</a></li><li><a href="global.html#create_tenant">create_tenant</a></li><li><a href="global.html#create_tenant_allowed">create_tenant_allowed</a></li><li><a href="global.html#createTenant">createTenant</a></li><li><a href="global.html#date">date</a></li><li><a href="global.html#db">db</a></li><li><a href="global.html#defaultDataPath">defaultDataPath</a></li><li><a href="global.html#deleteConfig">deleteConfig</a></li><li><a href="global.html#deleteTenant">deleteTenant</a></li><li><a href="global.html#deleteWhere">deleteWhere</a></li><li><a href="global.html#discover_tables">discover_tables</a></li><li><a href="global.html#discoverable_tables">discoverable_tables</a></li><li><a href="global.html#discoverForm">discoverForm</a></li><li><a href="global.html#domain_sanitize">domain_sanitize</a></li><li><a href="global.html#drop_reset_schema">drop_reset_schema</a></li><li><a href="global.html#drop_unique_constraint">drop_unique_constraint</a></li><li><a href="global.html#eachTenant">eachTenant</a></li><li><a href="global.html#email_form">email_form</a></li><li><a href="global.html#ensure_final_slash">ensure_final_slash</a></li><li><a href="global.html#express">express</a></li><li><a href="global.html#fetch">fetch</a></li><li><a href="global.html#field_picker_fields">field_picker_fields</a></li><li><a href="global.html#findType">findType</a></li><li><a href="global.html#float">float</a></li><li><a href="global.html#fs">fs</a></li><li><a href="global.html#get_base_url">get_base_url</a></li><li><a href="global.html#get_child_views">get_child_views</a></li><li><a href="global.html#get_db_filepath">get_db_filepath</a></li><li><a href="global.html#get_domain">get_domain</a></li><li><a href="global.html#get_existing_views">get_existing_views</a></li><li><a href="global.html#get_latest_npm_version">get_latest_npm_version</a></li><li><a href="global.html#get_link_view_opts">get_link_view_opts</a></li><li><a href="global.html#get_other_domain_tenant">get_other_domain_tenant</a></li><li><a href="global.html#get_parent_views">get_parent_views</a></li><li><a href="global.html#get_process_init_time">get_process_init_time</a></li><li><a href="global.html#get_sql_logging">get_sql_logging</a></li><li><a href="global.html#get_tenant_info">get_tenant_info</a></li><li><a href="global.html#getActionConfigFields">getActionConfigFields</a></li><li><a href="global.html#getAllConfig">getAllConfig</a></li><li><a href="global.html#getAllConfigOrDefaults">getAllConfigOrDefaults</a></li><li><a href="global.html#getAllTenants">getAllTenants</a></li><li><a href="global.html#getClient">getClient</a></li><li><a href="global.html#getConfig">getConfig</a></li><li><a href="global.html#getConfigFile">getConfigFile</a></li><li><a href="global.html#getConnectObject">getConnectObject</a></li><li><a href="global.html#getGitRevision">getGitRevision</a></li><li><a href="global.html#getNewURL">getNewURL</a></li><li><a href="global.html#getRootPageForm">getRootPageForm</a></li><li><a href="global.html#getTenant">getTenant</a></li><li><a href="global.html#getVersion">getVersion</a></li><li><a href="global.html#implement_discovery">implement_discovery</a></li><li><a href="global.html#init_multi_tenant">init_multi_tenant</a></li><li><a href="global.html#initial_config_all_fields">initial_config_all_fields</a></li><li><a href="global.html#insert">insert</a></li><li><a href="global.html#int">int</a></li><li><a href="global.html#is_ip_address">is_ip_address</a></li><li><a href="global.html#is_sqlite">is_sqlite</a></li><li><a href="global.html#isDate">isDate</a></li><li><a href="global.html#isFixedConfig">isFixedConfig</a></li><li><a href="global.html#jsgrid_controller">jsgrid_controller</a></li><li><a href="global.html#json_list_to_external_table">json_list_to_external_table</a></li><li><a href="global.html#link_view">link_view</a></li><li><a href="global.html#migrate">migrate</a></li><li><a href="global.html#moment">moment</a></li><li><a href="global.html#normalise_error_message">normalise_error_message</a></li><li><a href="global.html#path">path</a></li><li><a href="global.html#picked_fields_to_query">picked_fields_to_query</a></li><li><a href="global.html#post_delete_btn">post_delete_btn</a></li><li><a href="global.html#readState">readState</a></li><li><a href="global.html#readStateStrict">readStateStrict</a></li><li><a href="global.html#recalculate_for_stored">recalculate_for_stored</a></li><li><a href="global.html#remove_from_menu">remove_from_menu</a></li><li><a href="global.html#renameForm">renameForm</a></li><li><a href="global.html#reprAsJson">reprAsJson</a></li><li><a href="global.html#reset_sequence">reset_sequence</a></li><li><a href="global.html#restart_tenant">restart_tenant</a></li><li><a href="global.html#Router">Router</a></li><li><a href="global.html#run_action_column">run_action_column</a></li><li><a href="global.html#runScheduler">runScheduler</a></li><li><a href="global.html#select">select</a></li><li><a href="global.html#selectMaybeOne">selectMaybeOne</a></li><li><a href="global.html#selectOne">selectOne</a></li><li><a href="global.html#set_multitenancy_cfg">set_multitenancy_cfg</a></li><li><a href="global.html#set_sql_logging">set_sql_logging</a></li><li><a href="global.html#set_tenant_base_url">set_tenant_base_url</a></li><li><a href="global.html#setConfig">setConfig</a></li><li><a href="global.html#setEmailForm">setEmailForm</a></li><li><a href="global.html#sql_log">sql_log</a></li><li><a href="global.html#sqlsanitize">sqlsanitize</a></li><li><a href="global.html#sqlsanitizeAllowDots">sqlsanitizeAllowDots</a></li><li><a href="global.html#stateFieldsToQuery">stateFieldsToQuery</a></li><li><a href="global.html#stateFieldsToWhere">stateFieldsToWhere</a></li><li><a href="global.html#strictParseInt">strictParseInt</a></li><li><a href="global.html#string">string</a></li><li><a href="global.html#table">table</a></li><li><a href="global.html#tableBadges">tableBadges</a></li><li><a href="global.html#tableForm">tableForm</a></li><li><a href="global.html#tenant_form">tenant_form</a></li><li><a href="global.html#transposeObjects">transposeObjects</a></li><li><a href="global.html#triggerForm">triggerForm</a></li><li><a href="global.html#typeToJsGridType">typeToJsGridType</a></li><li><a href="global.html#update">update</a></li><li><a href="global.html#user_dropdown">user_dropdown</a></li><li><a href="global.html#versionsField">versionsField</a></li><li><a href="global.html#whereFTS">whereFTS</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.7</a> on Sat Jun 19 2021 10:29:18 GMT+0100 (British Summer Time)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

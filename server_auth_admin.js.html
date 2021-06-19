@@ -1,0 +1,793 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: server/auth/admin.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: server/auth/admin.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>/**
+ * Auth / Admin
+ * @type {module:express-promise-router}
+ */
+const Router = require("express-promise-router");
+const { contract, is } = require("contractis");
+
+const db = require("@saltcorn/data/db");
+const User = require("@saltcorn/data/models/user");
+const View = require("@saltcorn/data/models/view");
+const Field = require("@saltcorn/data/models/field");
+const Form = require("@saltcorn/data/models/form");
+const {
+  mkTable,
+  renderForm,
+  link,
+  post_btn,
+  settingsDropdown,
+  post_dropdown_item,
+} = require("@saltcorn/markup");
+const {
+  isAdmin,
+  setTenant,
+  error_catcher,
+} = require("../routes/utils");
+const { send_reset_email } = require("./resetpw");
+const { getState } = require("@saltcorn/data/db/state");
+const {
+  a,
+  div,
+  text,
+  span,
+  code,
+  h5,
+  i,
+  p,
+} = require("@saltcorn/markup/tags");
+const Table = require("@saltcorn/data/models/table");
+const {
+  send_users_page,
+  config_fields_form,
+  save_config_from_form,
+  getBaseDomain,
+  hostname_matches_baseurl,
+  is_hsts_tld,
+} = require("../markup/admin");
+const { send_verification_email } = require("@saltcorn/data/models/email");
+const router = new Router();
+module.exports = router;
+
+const getUserFields = async () => {
+  const userTable = await Table.findOne({ name: "users" });
+  const userFields = (await userTable.getFields()).filter(
+    (f) => !f.calculated &amp;&amp; f.name !== "id"
+  );
+  const iterForm = async (cfgField) => {
+    const signup_form_name = getState().getConfig(cfgField, "");
+    if (signup_form_name) {
+      const signup_form = await View.findOne({ name: signup_form_name });
+      if (signup_form) {
+        (signup_form.configuration.columns || []).forEach((f) => {
+          const uf = userFields.find((uff) => uff.name === f.field_name);
+          if (uf) {
+            uf.fieldview = f.fieldview;
+            uf.attributes = { ...f.configuration, ...uf.attributes };
+          }
+        });
+      }
+    }
+  };
+  await iterForm("signup_form");
+  await iterForm("new_user_form");
+
+  return userFields;
+};
+const userForm = contract(
+  is.fun(
+    [is.obj({}), is.maybe(is.class("User"))],
+    is.promise(is.class("Form"))
+  ),
+  async (req, user) => {
+    const roleField = new Field({
+      label: req.__("Role"),
+      name: "role_id",
+      type: "Key",
+      reftable_name: "roles",
+    });
+    const roles = (await User.get_roles()).filter((r) => r.role !== "public");
+    roleField.options = roles.map((r) => ({ label: r.role, value: r.id }));
+    const can_reset = getState().getConfig("smtp_host", "") !== "";
+    const userFields = await getUserFields();
+    const form = new Form({
+      fields: [roleField, ...userFields],
+      action: "/useradmin/save",
+      submitLabel: user ? req.__("Save") : req.__("Create"),
+    });
+    if (!user) {
+      form.fields.push(
+        new Field({
+          label: req.__("Set random password"),
+          name: "rnd_password",
+          type: "Bool",
+          default: true,
+        })
+      );
+      form.fields.push(
+        new Field({
+          label: req.__("Password"),
+          name: "password",
+          input_type: "password",
+          showIf: { rnd_password: false },
+        })
+      );
+      can_reset &amp;&amp;
+        form.fields.push(
+          new Field({
+            label: req.__("Send password reset email"),
+            name: "send_pwreset_email",
+            type: "Bool",
+            default: true,
+            showIf: { rnd_password: true },
+          })
+        );
+    }
+    if (user) {
+      form.hidden("id");
+      form.values = user;
+      delete form.values.password;
+    } else {
+      form.values.role_id = roles[roles.length - 1].id;
+    }
+    return form;
+  }
+);
+/**
+ * Dropdown for User Info in left menu
+ * @param user
+ * @param req
+ * @param can_reset
+ * @returns {string}
+ */
+const user_dropdown = (user, req, can_reset) =>
+  settingsDropdown(`dropdownMenuButton${user.id}`, [
+    a(
+      {
+        class: "dropdown-item",
+        href: `/useradmin/${user.id}`,
+      },
+      '&lt;i class="fas fa-edit">&lt;/i>&amp;nbsp;' + req.__("Edit")
+    ),
+    post_dropdown_item(
+      `/useradmin/set-random-password/${user.id}`,
+      '&lt;i class="fas fa-random">&lt;/i>&amp;nbsp;' + req.__("Set random password"),
+      req
+    ),
+    can_reset &amp;&amp;
+      post_dropdown_item(
+        `/useradmin/reset-password/${user.id}`,
+        '&lt;i class="fas fa-envelope">&lt;/i>&amp;nbsp;' +
+          req.__("Send password reset email"),
+        req
+      ),
+    can_reset &amp;&amp;
+      !user.verified_on &amp;&amp;
+      getState().getConfig("verification_view", "") &amp;&amp;
+      post_dropdown_item(
+        `/useradmin/send-verification/${user.id}`,
+        '&lt;i class="fas fa-envelope">&lt;/i>&amp;nbsp;' +
+          req.__("Send verification email"),
+        req
+      ),
+    user.disabled &amp;&amp;
+      post_dropdown_item(
+        `/useradmin/enable/${user.id}`,
+        '&lt;i class="fas fa-play">&lt;/i>&amp;nbsp;' + req.__("Enable"),
+        req
+      ),
+    !user.disabled &amp;&amp;
+      post_dropdown_item(
+        `/useradmin/disable/${user.id}`,
+        '&lt;i class="fas fa-pause">&lt;/i>&amp;nbsp;' + req.__("Disable"),
+        req
+      ),
+    div({ class: "dropdown-divider" }),
+    post_dropdown_item(
+      `/useradmin/delete/${user.id}`,
+      '&lt;i class="far fa-trash-alt">&lt;/i>&amp;nbsp;' + req.__("Delete"),
+      req,
+      true,
+      user.email
+    ),
+  ]);
+
+router.get(
+  "/",
+  setTenant,
+  isAdmin,
+  error_catcher(async (req, res) => {
+    const users = await User.find({}, { orderBy: "id" });
+    const roles = await User.get_roles();
+    var roleMap = {};
+    roles.forEach((r) => {
+      roleMap[r.id] = r.role;
+    });
+    const can_reset = getState().getConfig("smtp_host", "") !== "";
+    send_users_page({
+      res,
+      req,
+      active_sub: "Users",
+      contents: {
+        type: "card",
+        title: req.__("Users"),
+        contents: [
+          mkTable(
+            [
+              { label: req.__("ID"), key: "id" },
+              {
+                label: req.__("Email"),
+                key: (r) => link(`/useradmin/${r.id}`, r.email),
+              },
+              {
+                label: "",
+                key: (r) =>
+                  r.disabled
+                    ? span({ class: "badge badge-danger" }, "Disabled")
+                    : "",
+              },
+              {
+                label: req.__("Verified"),
+                key: (r) =>
+                  !!r.verified_on
+                    ? i({
+                        class: "fas fa-check-circle text-success",
+                      })
+                    : "",
+              },
+              { label: req.__("Role"), key: (r) => roleMap[r.role_id] },
+              {
+                label: "",
+                key: (r) => user_dropdown(r, req, can_reset),
+              },
+            ],
+            users,
+            { hover: true }
+          ),
+          link(`/useradmin/new`, req.__("Create user")),
+        ],
+      },
+    });
+  })
+);
+
+router.get(
+  "/new",
+  setTenant,
+  isAdmin,
+  error_catcher(async (req, res) => {
+    const form = await userForm(req);
+    send_users_page({
+      res,
+      req,
+      active_sub: "Users",
+      sub2_page: "New",
+      contents: {
+        type: "card",
+        title: req.__("New user"),
+        contents: [renderForm(form, req.csrfToken())],
+      },
+    });
+  })
+);
+
+const user_settings_form = (req) =>
+  config_fields_form({
+    req,
+    field_names: [
+      "allow_signup",
+      "login_menu",
+      "new_user_form",
+      "login_form",
+      "signup_form",
+      "user_settings_form",
+      "verification_view",
+      "elevate_verified",
+      "min_role_upload",
+      "timeout",
+      "email_mask",
+      "allow_forgot",
+      "cookie_sessions",
+      "custom_http_headers",
+    ],
+    action: "/useradmin/settings",
+    submitLabel: req.__("Save"),
+  });
+router.get(
+  "/settings",
+  setTenant,
+  isAdmin,
+  error_catcher(async (req, res) => {
+    const form = await user_settings_form(req);
+    send_users_page({
+      res,
+      req,
+      active_sub: "Settings",
+      contents: {
+        type: "card",
+        title: req.__("Authentication settings"),
+        contents: [renderForm(form, req.csrfToken())],
+      },
+    });
+  })
+);
+router.post(
+  "/settings",
+  setTenant,
+  isAdmin,
+  error_catcher(async (req, res) => {
+    const form = await user_settings_form(req);
+    form.validate(req.body);
+    if (form.hasErrors) {
+      send_users_page({
+        res,
+        req,
+        active_sub: "Settings",
+        contents: {
+          type: "card",
+          title: req.__("Authentication settings"),
+          contents: [renderForm(form, req.csrfToken())],
+        },
+      });
+    } else {
+      await save_config_from_form(form);
+      req.flash("success", req.__("User settings updated"));
+      res.redirect("/useradmin/settings");
+    }
+  })
+);
+
+router.get(
+  "/ssl",
+  setTenant,
+  isAdmin,
+  error_catcher(async (req, res) => {
+    const isRoot = db.getTenantSchema() === db.connectObj.default_schema;
+    if (!isRoot) {
+      req.flash(
+        "warning",
+        req.__("SSL settings not available for subdomain tenants")
+      );
+      res.redirect("/useradmin");
+      return;
+    }
+    // TBD describe logic around letsencrypt
+    const letsencrypt = getState().getConfig("letsencrypt", false);
+    const has_custom =
+      getState().getConfig("custom_ssl_certificate", false) &amp;&amp;
+      getState().getConfig("custom_ssl_private_key", false);
+    const show_warning =
+      !hostname_matches_baseurl(req, getBaseDomain()) &amp;&amp;
+      is_hsts_tld(getBaseDomain());
+    send_users_page({
+      res,
+      req,
+      active_sub: "SSL",
+      contents: {
+        above: [
+          ...(letsencrypt &amp;&amp; has_custom
+            ? [
+                {
+                  type: "card",
+                  contents: p(
+                    req.__(
+                      "You have enabled both Let's Encrypt certificates and custom SSL certificates. Let's Encrypt takes priority and the custom certificates will be ignored."
+                    )
+                  ),
+                },
+              ]
+            : []),
+          {
+            type: "card",
+            title: req.__(
+              "HTTPS encryption with Let's Encrypt SSL certificate"
+            ),
+            contents: [
+              p(
+                req.__(
+                  `Saltcorn can automatically obtain an SSL certificate from &lt;a href="https://letsencrypt.org/">Let's Encrypt&lt;/a> for single domains`
+                )
+              ),
+              h5(
+                req.__("Currently: "),
+                letsencrypt
+                  ? span({ class: "badge badge-primary" }, req.__("Enabled"))
+                  : span({ class: "badge badge-secondary" }, req.__("Disabled"))
+              ),
+              letsencrypt
+                ? post_btn(
+                    "/config/delete/letsencrypt",
+                    req.__("Disable LetsEncrypt HTTPS"),
+                    req.csrfToken(),
+                    { btnClass: "btn-danger", req }
+                  )
+                : post_btn(
+                    "/admin/enable-letsencrypt",
+                    req.__("Enable LetsEncrypt HTTPS"),
+                    req.csrfToken(),
+                    { confirm: true, req }
+                  ),
+              !letsencrypt &amp;&amp;
+                show_warning &amp;&amp;
+                !has_custom &amp;&amp;
+                div(
+                  { class: "mt-3 alert alert-danger" },
+                  p(
+                      req.__(
+                          "The address you are using to reach Saltcorn does not match the Base URL."
+                      )
+                  ),
+                  p(
+                      req.__(
+                          "The DNS A records (for * and @, or a subdomain) should point to this server's IP address before enabling LetsEncrypt"
+                      )
+                  )
+                ),
+            ],
+          },
+          {
+            type: "card",
+            title: req.__("HTTPS encryption with custom SSL certificate"),
+            contents: [
+              p(
+                req.__(
+                  `Or use custom SSL certificates, including wildcard certificates for multitenant applications`
+                )
+              ),
+              h5(
+                req.__("Currently: "),
+                has_custom
+                  ? span({ class: "badge badge-primary" }, req.__("Enabled"))
+                  : span({ class: "badge badge-secondary" }, req.__("Disabled"))
+              ),
+                // TBD change to button
+              link("/useradmin/ssl/custom", req.__("Edit custom SSL certificates")),
+            ],
+          },
+        ],
+      },
+    });
+  })
+);
+
+const ssl_form = (req) =>
+  config_fields_form({
+    req,
+    field_names: ["custom_ssl_certificate", "custom_ssl_private_key"],
+    action: "/useradmin/ssl/custom",
+  });
+router.get(
+  "/ssl/custom",
+  setTenant,
+  isAdmin,
+  error_catcher(async (req, res) => {
+    const form = await ssl_form(req);
+    send_users_page({
+      res,
+      req,
+      active_sub: "Settings",
+      contents: {
+        type: "card",
+        title: req.__("Authentication settings"),
+        sub2_page: req.__("Custom SSL certificates"),
+        contents: [renderForm(form, req.csrfToken())],
+      },
+    });
+  })
+);
+router.post(
+  "/ssl/custom",
+  setTenant,
+  isAdmin,
+  error_catcher(async (req, res) => {
+    const form = await ssl_form(req);
+    form.validate(req.body);
+    if (form.hasErrors) {
+      send_users_page({
+        res,
+        req,
+        active_sub: "Settings",
+        contents: {
+          type: "card",
+          title: req.__("Authentication settings"),
+          sub2_page: req.__("Custom SSL certificates"),
+          contents: [renderForm(form, req.csrfToken())],
+        },
+      });
+    } else {
+      await save_config_from_form(form);
+      req.flash(
+        "success",
+        req.__("Custom SSL enabled. Restart for changes to take effect.") +
+          " " +
+          a({ href: "/admin/system" }, req.__("Restart here"))
+      );
+      res.redirect("/useradmin/ssl");
+    }
+  })
+);
+router.get(
+  "/:id",
+  setTenant,
+  isAdmin,
+  error_catcher(async (req, res) => {
+    const { id } = req.params;
+    const user = await User.findOne({ id });
+    const form = await userForm(req, user);
+
+    send_users_page({
+      res,
+      req,
+      active_sub: "Users",
+      sub2_page: user.email,
+      contents: {
+        above: [
+          {
+            type: "card",
+            title: req.__("Edit user %s", user.email),
+            contents: renderForm(form, req.csrfToken()),
+          },
+          {
+            type: "card",
+            title: req.__("API token"),
+            contents: [
+              // api token for user
+              div(
+                user.api_token
+                  ? span({ class: "mr-1" }, req.__("API token for this user: ")) +
+                      code(user.api_token)
+                  : req.__("No API token issued")
+              ),
+              // button for reset or generate api token
+              div(
+                { class: "mt-4" },
+                post_btn(
+                  `/useradmin/gen-api-token/${user.id}`,
+                  user.api_token ? req.__("Reset") : req.__("Generate"),
+                  req.csrfToken()
+                )
+              ),
+              // button for remove api token
+              user.api_token &amp;&amp; div(
+                  { class: "mt-4" },
+                  post_btn(
+                      `/useradmin/remove-api-token/${user.id}`,
+                      // TBD localization
+                      user.api_token ? req.__("Remove") : req.__("Generate"),
+                      req.csrfToken(),
+                      { req: req, confirm: true }
+                  )
+                ),
+            ],
+          },
+        ],
+      },
+    });
+  })
+);
+/**
+ * Save user data
+ */
+router.post(
+  "/save",
+  setTenant,
+  isAdmin,
+  error_catcher(async (req, res) => {
+    let {
+      email,
+      password,
+      role_id,
+      id,
+      rnd_password,
+      send_pwreset_email,
+      _csrf,
+      ...rest
+    } = req.body;
+    if (id) {
+      try {
+        await db.update("users", { email, role_id, ...rest }, id);
+        req.flash("success", req.__(`User %s saved`, email));
+      } catch (e) {
+        req.flash("error", req.__(`Error editing user: %s`, e.message));
+      }
+    } else {
+      if (rnd_password) password = User.generate_password();
+      const u = await User.create({
+        email,
+        password,
+        role_id: +role_id,
+        ...rest,
+      });
+      const pwflash =
+        rnd_password &amp;&amp; !send_pwreset_email
+          ? req.__(` with password %s`, code(password))
+          : "";
+      if (u.error) req.flash("error", u.error);
+      else req.flash("success", req.__(`User %s created`, email) + pwflash);
+      if (rnd_password &amp;&amp; send_pwreset_email) await send_reset_email(u, req);
+    }
+    res.redirect(`/useradmin`);
+  })
+);
+/**
+ * Reset password for yser
+ */
+router.post(
+  "/reset-password/:id",
+  setTenant,
+  isAdmin,
+  error_catcher(async (req, res) => {
+    const { id } = req.params;
+    const u = await User.findOne({ id });
+    await send_reset_email(u, req);
+    req.flash("success", req.__(`Reset password link sent to %s`, u.email));
+
+    res.redirect(`/useradmin`);
+  })
+);
+/**
+ * Send verification email for user
+ */
+router.post(
+  "/send-verification/:id",
+  setTenant,
+  isAdmin,
+  error_catcher(async (req, res) => {
+    const { id } = req.params;
+    const u = await User.findOne({ id });
+    const result = await send_verification_email(u);
+    console.log(result);
+    if (result.error) req.flash("danger", result.error);
+    else
+      req.flash(
+        "success",
+        req.__(`Email verification link sent to %s`, u.email)
+      );
+
+    res.redirect(`/useradmin`);
+  })
+);
+/**
+ * Get new api token
+ */
+router.post(
+  "/gen-api-token/:id",
+  setTenant,
+  isAdmin,
+  error_catcher(async (req, res) => {
+    const { id } = req.params;
+    const u = await User.findOne({ id });
+    await u.getNewAPIToken();
+    req.flash("success", req.__(`New API token generated`));
+
+    res.redirect(`/useradmin/${u.id}`);
+  })
+);
+/**
+ * Remove api token
+ */
+router.post(
+    "/remove-api-token/:id",
+    setTenant,
+    isAdmin,
+    error_catcher(async (req, res) => {
+        const { id } = req.params;
+        const u = await User.findOne({ id });
+        await u.removeAPIToken();
+        req.flash("success", req.__(`API token removed`));
+
+        res.redirect(`/useradmin/${u.id}`);
+    })
+);
+/**
+ * Set random password
+ */
+router.post(
+  "/set-random-password/:id",
+  setTenant,
+  isAdmin,
+  error_catcher(async (req, res) => {
+    const { id } = req.params;
+    const u = await User.findOne({ id });
+    const newpw = User.generate_password();
+    await u.changePasswordTo(newpw);
+    await u.destroy_sessions();
+    req.flash(
+      "success",
+      req.__(`Changed password for user %s to %s`, u.email, newpw)
+    );
+
+    res.redirect(`/useradmin`);
+  })
+);
+
+router.post(
+  "/disable/:id",
+  setTenant,
+  isAdmin,
+  error_catcher(async (req, res) => {
+    const { id } = req.params;
+    const u = await User.findOne({ id });
+    await u.update({ disabled: true });
+    await u.destroy_sessions();
+    req.flash("success", req.__(`Disabled user %s`, u.email));
+    res.redirect(`/useradmin`);
+  })
+);
+
+router.post(
+  "/enable/:id",
+  setTenant,
+  isAdmin,
+  error_catcher(async (req, res) => {
+    const { id } = req.params;
+    const u = await User.findOne({ id });
+    await u.update({ disabled: false });
+    req.flash("success", req.__(`Enabled user %s`, u.email));
+    res.redirect(`/useradmin`);
+  })
+);
+
+router.post(
+  "/delete/:id",
+  setTenant,
+  isAdmin,
+  error_catcher(async (req, res) => {
+    const { id } = req.params;
+    const u = await User.findOne({ id });
+    await u.delete();
+    req.flash("success", req.__(`User %s deleted`, u.email));
+
+    res.redirect(`/useradmin`);
+  })
+);
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Classes</h3><ul><li><a href="Field.html">Field</a></li><li><a href="File.html">File</a></li><li><a href="Page.html">Page</a></li><li><a href="Plugin.html">Plugin</a></li><li><a href="PluginsCommand.html">PluginsCommand</a></li><li><a href="State.html">State</a></li><li><a href="Table.html">Table</a></li><li><a href="Trigger.html">Trigger</a></li><li><a href="User.html">User</a></li><li><a href="global.html#View">View</a></li></ul><h3>Global</h3><ul><li><a href="global.html#add_unique_constraint">add_unique_constraint</a></li><li><a href="global.html#addOrCreateList">addOrCreateList</a></li><li><a href="global.html#bool">bool</a></li><li><a href="global.html#calcfldViewConfig">calcfldViewConfig</a></li><li><a href="global.html#calcfldViewOptions">calcfldViewOptions</a></li><li><a href="global.html#changeConnection">changeConnection</a></li><li><a href="global.html#check_email_mask">check_email_mask</a></li><li><a href="global.html#close">close</a></li><li><a href="global.html#color">color</a></li><li><a href="global.html#configFileDir">configFileDir</a></li><li><a href="global.html#configFilePath">configFilePath</a></li><li><a href="global.html#configTypes">configTypes</a></li><li><a href="global.html#constraintForm">constraintForm</a></li><li><a href="global.html#copyFrom">copyFrom</a></li><li><a href="global.html#copyFrom1">copyFrom1</a></li><li><a href="global.html#count">count</a></li><li><a href="global.html#create_blank_migration">create_blank_migration</a></li><li><a href="global.html#create_tenant">create_tenant</a></li><li><a href="global.html#create_tenant_allowed">create_tenant_allowed</a></li><li><a href="global.html#createTenant">createTenant</a></li><li><a href="global.html#date">date</a></li><li><a href="global.html#db">db</a></li><li><a href="global.html#defaultDataPath">defaultDataPath</a></li><li><a href="global.html#deleteConfig">deleteConfig</a></li><li><a href="global.html#deleteTenant">deleteTenant</a></li><li><a href="global.html#deleteWhere">deleteWhere</a></li><li><a href="global.html#discover_tables">discover_tables</a></li><li><a href="global.html#discoverable_tables">discoverable_tables</a></li><li><a href="global.html#discoverForm">discoverForm</a></li><li><a href="global.html#domain_sanitize">domain_sanitize</a></li><li><a href="global.html#drop_reset_schema">drop_reset_schema</a></li><li><a href="global.html#drop_unique_constraint">drop_unique_constraint</a></li><li><a href="global.html#eachTenant">eachTenant</a></li><li><a href="global.html#email_form">email_form</a></li><li><a href="global.html#ensure_final_slash">ensure_final_slash</a></li><li><a href="global.html#express">express</a></li><li><a href="global.html#fetch">fetch</a></li><li><a href="global.html#field_picker_fields">field_picker_fields</a></li><li><a href="global.html#findType">findType</a></li><li><a href="global.html#float">float</a></li><li><a href="global.html#fs">fs</a></li><li><a href="global.html#get_base_url">get_base_url</a></li><li><a href="global.html#get_child_views">get_child_views</a></li><li><a href="global.html#get_db_filepath">get_db_filepath</a></li><li><a href="global.html#get_domain">get_domain</a></li><li><a href="global.html#get_existing_views">get_existing_views</a></li><li><a href="global.html#get_latest_npm_version">get_latest_npm_version</a></li><li><a href="global.html#get_link_view_opts">get_link_view_opts</a></li><li><a href="global.html#get_other_domain_tenant">get_other_domain_tenant</a></li><li><a href="global.html#get_parent_views">get_parent_views</a></li><li><a href="global.html#get_process_init_time">get_process_init_time</a></li><li><a href="global.html#get_sql_logging">get_sql_logging</a></li><li><a href="global.html#get_tenant_info">get_tenant_info</a></li><li><a href="global.html#getActionConfigFields">getActionConfigFields</a></li><li><a href="global.html#getAllConfig">getAllConfig</a></li><li><a href="global.html#getAllConfigOrDefaults">getAllConfigOrDefaults</a></li><li><a href="global.html#getAllTenants">getAllTenants</a></li><li><a href="global.html#getClient">getClient</a></li><li><a href="global.html#getConfig">getConfig</a></li><li><a href="global.html#getConfigFile">getConfigFile</a></li><li><a href="global.html#getConnectObject">getConnectObject</a></li><li><a href="global.html#getGitRevision">getGitRevision</a></li><li><a href="global.html#getNewURL">getNewURL</a></li><li><a href="global.html#getRootPageForm">getRootPageForm</a></li><li><a href="global.html#getTenant">getTenant</a></li><li><a href="global.html#getVersion">getVersion</a></li><li><a href="global.html#implement_discovery">implement_discovery</a></li><li><a href="global.html#init_multi_tenant">init_multi_tenant</a></li><li><a href="global.html#initial_config_all_fields">initial_config_all_fields</a></li><li><a href="global.html#insert">insert</a></li><li><a href="global.html#int">int</a></li><li><a href="global.html#is_ip_address">is_ip_address</a></li><li><a href="global.html#is_sqlite">is_sqlite</a></li><li><a href="global.html#isDate">isDate</a></li><li><a href="global.html#isFixedConfig">isFixedConfig</a></li><li><a href="global.html#jsgrid_controller">jsgrid_controller</a></li><li><a href="global.html#json_list_to_external_table">json_list_to_external_table</a></li><li><a href="global.html#link_view">link_view</a></li><li><a href="global.html#migrate">migrate</a></li><li><a href="global.html#moment">moment</a></li><li><a href="global.html#normalise_error_message">normalise_error_message</a></li><li><a href="global.html#path">path</a></li><li><a href="global.html#picked_fields_to_query">picked_fields_to_query</a></li><li><a href="global.html#post_delete_btn">post_delete_btn</a></li><li><a href="global.html#readState">readState</a></li><li><a href="global.html#readStateStrict">readStateStrict</a></li><li><a href="global.html#recalculate_for_stored">recalculate_for_stored</a></li><li><a href="global.html#remove_from_menu">remove_from_menu</a></li><li><a href="global.html#renameForm">renameForm</a></li><li><a href="global.html#reprAsJson">reprAsJson</a></li><li><a href="global.html#reset_sequence">reset_sequence</a></li><li><a href="global.html#restart_tenant">restart_tenant</a></li><li><a href="global.html#Router">Router</a></li><li><a href="global.html#run_action_column">run_action_column</a></li><li><a href="global.html#runScheduler">runScheduler</a></li><li><a href="global.html#select">select</a></li><li><a href="global.html#selectMaybeOne">selectMaybeOne</a></li><li><a href="global.html#selectOne">selectOne</a></li><li><a href="global.html#set_multitenancy_cfg">set_multitenancy_cfg</a></li><li><a href="global.html#set_sql_logging">set_sql_logging</a></li><li><a href="global.html#set_tenant_base_url">set_tenant_base_url</a></li><li><a href="global.html#setConfig">setConfig</a></li><li><a href="global.html#setEmailForm">setEmailForm</a></li><li><a href="global.html#sql_log">sql_log</a></li><li><a href="global.html#sqlsanitize">sqlsanitize</a></li><li><a href="global.html#sqlsanitizeAllowDots">sqlsanitizeAllowDots</a></li><li><a href="global.html#stateFieldsToQuery">stateFieldsToQuery</a></li><li><a href="global.html#stateFieldsToWhere">stateFieldsToWhere</a></li><li><a href="global.html#strictParseInt">strictParseInt</a></li><li><a href="global.html#string">string</a></li><li><a href="global.html#table">table</a></li><li><a href="global.html#tableBadges">tableBadges</a></li><li><a href="global.html#tableForm">tableForm</a></li><li><a href="global.html#tenant_form">tenant_form</a></li><li><a href="global.html#transposeObjects">transposeObjects</a></li><li><a href="global.html#triggerForm">triggerForm</a></li><li><a href="global.html#typeToJsGridType">typeToJsGridType</a></li><li><a href="global.html#update">update</a></li><li><a href="global.html#user_dropdown">user_dropdown</a></li><li><a href="global.html#versionsField">versionsField</a></li><li><a href="global.html#whereFTS">whereFTS</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.7</a> on Sat Jun 19 2021 10:29:18 GMT+0100 (British Summer Time)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

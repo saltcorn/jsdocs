@@ -1,0 +1,1123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: server/auth/routes.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: server/auth/routes.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>const Router = require("express-promise-router");
+
+const db = require("@saltcorn/data/db");
+const User = require("@saltcorn/data/models/user");
+const Field = require("@saltcorn/data/models/field");
+const Form = require("@saltcorn/data/models/form");
+const { send_verification_email } = require("@saltcorn/data/models/email");
+const {
+  setTenant,
+  error_catcher,
+  loggedIn,
+  csrfField,
+} = require("../routes/utils.js");
+const { getState } = require("@saltcorn/data/db/state");
+const { send_reset_email } = require("./resetpw");
+const {
+  renderForm,
+} = require("@saltcorn/markup");
+const passport = require("passport");
+const {
+  a,
+  text,
+  table,
+  tbody,
+  th,
+  td,
+  tr,
+  form,
+  select,
+  option,
+} = require("@saltcorn/markup/tags");
+const {
+  available_languages,
+  check_email_mask,
+} = require("@saltcorn/data/models/config");
+const rateLimit = require("express-rate-limit");
+const moment = require("moment");
+const View = require("@saltcorn/data/models/view");
+const Table = require("@saltcorn/data/models/table");
+const { InvalidConfiguration } = require("@saltcorn/data/utils");
+const router = new Router();
+module.exports = router;
+
+const loginForm = (req, isCreating) => {
+  const postAuthMethods = Object.entries(getState().auth_methods)
+      // TBD unresolved parameter K
+      // TBD unresolved postUsernamePassword
+    .filter(([k, v]) => v.postUsernamePassword)
+    .map(([k, v]) => v);
+  const user_sublabel = postAuthMethods
+      // TBD unresolved usernameLabel
+    .map((auth) => `${auth.usernameLabel} for ${auth.label}`)
+    .join(", ");
+  return new Form({
+    class: "login",
+    fields: [
+      new Field({
+        label: req.__("E-mail"),
+        name: "email",
+        input_type: "text",
+        sublabel: user_sublabel || undefined,
+        validator: (s) => s.length &lt; 128,
+      }),
+      new Field({
+        label: req.__("Password"),
+        name: "password",
+        input_type: "password",
+        validator: isCreating
+          ? (pw) => User.unacceptable_password_reason(pw)
+          : undefined,
+      }),
+    ],
+    action: "/auth/login",
+    submitLabel: req.__("Login"),
+  });
+};
+const forgotForm = (req) =>
+  new Form({
+    blurb: req.__(
+      "Enter your email address below and we'll send you a link to reset your password."
+    ),
+    fields: [
+      new Field({
+        label: req.__("E-mail"),
+        name: "email",
+        input_type: "text",
+        validator: (s) => s.length &lt; 128,
+      }),
+    ],
+    action: "/auth/forgot",
+    submitLabel: req.__("Reset password"),
+  });
+
+const resetForm = (body, req) => {
+  const form = new Form({
+    blurb: req.__("Enter your new password below"),
+    fields: [
+      new Field({
+        label: req.__("Password"),
+        name: "password",
+        input_type: "password",
+      }),
+      new Field({
+        name: "token",
+        input_type: "hidden",
+      }),
+      new Field({
+        name: "email",
+        input_type: "hidden",
+      }),
+    ],
+    action: "/auth/reset",
+    submitLabel: req.__("Set password"),
+  });
+  form.values.email = body &amp;&amp; body.email;
+  form.values.token = body &amp;&amp; body.token;
+  return form;
+};
+const getAuthLinks = (current, noMethods) => {
+  const links = { methods: [] };
+  const state = getState();
+  if (current !== "login") links.login = "/auth/login";
+  if (current !== "signup" &amp;&amp; state.getConfig("allow_signup"))
+    links.signup = "/auth/signup";
+  if (current !== "forgot" &amp;&amp; state.getConfig("allow_forgot"))
+    links.forgot = "/auth/forgot";
+  if (!noMethods)
+    Object.entries(getState().auth_methods).forEach(([name, auth]) => {
+      const url = auth.postUsernamePassword
+        ? `javascript:$('form.login').attr('action','/auth/login-with/${name}').submit();`
+        : `/auth/login-with/${name}`;
+      links.methods.push({
+        icon: auth.icon,
+        label: auth.label,
+        name,
+        url,
+      });
+    });
+  return links;
+};
+
+router.get(
+  "/login",
+  setTenant,
+  error_catcher(async (req, res) => {
+    const login_form_name = getState().getConfig("login_form", "");
+    if (login_form_name) {
+      const login_form = await View.findOne({ name: login_form_name });
+      if (!login_form)
+        res.sendAuthWrap(
+          req.__(`Login`),
+          loginForm(req),
+          getAuthLinks("login")
+        );
+      else {
+        const resp = await login_form.run_possibly_on_page({}, req, res);
+        if (login_form.default_render_page) res.sendWrap(req.__(`Login`), resp);
+        else res.sendAuthWrap(req.__(`Login`), resp, { methods: [] });
+      }
+    } else
+      res.sendAuthWrap(req.__(`Login`), loginForm(req), getAuthLinks("login"));
+  })
+);
+
+router.get("/logout", setTenant, (req, res) => {
+  req.logout();
+  if (req.session.destroy)
+    req.session.destroy((err) => {
+        // TBD unresolved function next
+      if (err) return next(err);
+      req.logout();
+      res.redirect("/auth/login");
+    });
+  else {
+    req.logout();
+    req.session = null;
+    res.redirect("/auth/login");
+  }
+});
+
+router.get(
+  "/forgot",
+  setTenant,
+  error_catcher(async (req, res) => {
+    if (getState().getConfig("allow_forgot", false)) {
+      res.sendAuthWrap(
+        req.__(`Reset password`),
+        forgotForm(req),
+        getAuthLinks("forgot")
+      );
+    } else {
+      req.flash(
+        "danger",
+        req.__("Password reset not enabled. Contact your administrator.")
+      );
+      res.redirect("/auth/login");
+    }
+  })
+);
+
+router.get(
+  "/reset",
+  setTenant,
+  error_catcher(async (req, res) => {
+    const form = resetForm(req.query, req);
+    res.sendAuthWrap(req.__(`Reset password`), form, {});
+  })
+);
+
+router.get(
+  "/verify",
+  setTenant,
+  error_catcher(async (req, res) => {
+    const { token, email } = req.query;
+    const result = await User.verifyWithToken({
+      email,
+      verification_token: token,
+    });
+    if (result.error) req.flash("danger", result.error);
+    else if (result) req.flash("success", req.__("Email verified"));
+    res.redirect("/");
+  })
+);
+
+router.post(
+  "/reset",
+  setTenant,
+  error_catcher(async (req, res) => {
+    const result = await User.resetPasswordWithToken({
+      email: req.body.email,
+      reset_password_token: req.body.token,
+      password: req.body.password,
+    });
+    if (result.success) {
+      req.flash(
+        "success",
+        req.__("Password reset. Log in with your new password")
+      );
+    } else {
+      req.flash("danger", result.error);
+    }
+    res.redirect("/auth/login");
+  })
+);
+router.post(
+  "/forgot",
+  setTenant,
+  error_catcher(async (req, res) => {
+    if (getState().getConfig("allow_forgot")) {
+      const { email } = req.body;
+      const u = await User.findOne({ email });
+      const respond = () => {
+        req.flash("success", req.__("Email with password reset link sent"));
+        res.redirect("/auth/login");
+      };
+      if (!u) {
+        respond();
+        return;
+      }
+      //send email
+      await send_reset_email(u, req);
+
+      respond();
+    } else {
+      req.flash(
+        "danger",
+        req.__("Password reset not enabled. Contact your administrator.")
+      );
+      res.redirect("/auth/login");
+    }
+  })
+);
+router.get(
+  "/signup",
+  setTenant,
+  error_catcher(async (req, res) => {
+    if (!getState().getConfig("allow_signup")) {
+      req.flash("danger", req.__("Signups not enabled"));
+      res.redirect("/auth/login");
+      return;
+    }
+    const defaultSignup = async () => {
+      const form = loginForm(req, true);
+      const new_user_form = getState().getConfig("new_user_form", "");
+      if (!new_user_form) {
+        const userTable = await Table.findOne({ name: "users" });
+        const userFields = await userTable.getFields();
+
+        for (const f of userFields) {
+          if (f.required &amp;&amp; !f.calculated &amp;&amp; !["id", "email"].includes(f.name))
+            form.fields.push(f);
+        }
+      }
+      form.action = "/auth/signup";
+      form.submitLabel = req.__("Sign up");
+      res.sendAuthWrap(req.__(`Sign up`), form, getAuthLinks("signup"));
+    };
+    const signup_form_name = getState().getConfig("signup_form", "");
+    if (signup_form_name) {
+      const signup_form = await View.findOne({ name: signup_form_name });
+      if (!signup_form) await defaultSignup();
+      else {
+        const resp = await signup_form.run_possibly_on_page({}, req, res);
+        if (signup_form.default_render_page)
+          res.sendWrap(req.__(`Sign up`), resp);
+        else res.sendAuthWrap(req.__(`Sign up`), resp, { methods: [] });
+      }
+    } else await defaultSignup();
+  })
+);
+
+router.get(
+  "/create_first_user",
+  setTenant,
+  error_catcher(async (req, res) => {
+    const hasUsers = await User.nonEmpty();
+    if (!hasUsers) {
+      const form = loginForm(req, true);
+      form.action = "/auth/create_first_user";
+      form.submitLabel = req.__("Create user");
+      form.blurb = req.__(
+        "Please create your first user account, which will have administrative privileges. You can add other users and give them administrative privileges later."
+      );
+      res.sendAuthWrap(req.__(`Create first user`), form, {});
+    } else {
+      req.flash("danger", req.__("Users already present"));
+      res.redirect("/auth/login");
+    }
+  })
+);
+router.post(
+  "/create_first_user",
+  setTenant,
+  error_catcher(async (req, res) => {
+    const hasUsers = await User.nonEmpty();
+    if (!hasUsers) {
+      const form = loginForm(req, true);
+      form.validate(req.body);
+
+      if (form.hasErrors) {
+        form.action = "/auth/create_first_user";
+        form.submitLabel = req.__("Create user");
+        form.blurb = req.__(
+          "Please create your first user account, which will have administrative privileges. You can add other users and give them administrative privileges later."
+        );
+        res.sendAuthWrap(req.__(`Create first user`), form, {});
+      } else {
+        const { email, password } = form.values;
+        const u = await User.create({ email, password, role_id: 1 });
+        req.login(
+          {
+            email: u.email,
+            id: u.id,
+            role_id: u.role_id,
+            tenant: db.getTenantSchema(),
+          },
+          function (err) {
+            if (!err) {
+              res.redirect("/");
+            } else {
+              req.flash("danger", err);
+              res.redirect("/auth/signup");
+            }
+          }
+        );
+      }
+    } else {
+      req.flash("danger", req.__("Users already present"));
+      res.redirect("/auth/login");
+    }
+  })
+);
+
+const getNewUserForm = async (new_user_view_name, req, askEmail) => {
+  const view = await View.findOne({ name: new_user_view_name });
+  if (!view)
+    throw new InvalidConfiguration("New user form view does not exist");
+  const table = await Table.findOne({ name: "users" });
+  const fields = await table.getFields();
+  const { columns, layout } = view.configuration;
+
+  const tfields = (columns || [])
+    .map((column) => {
+      if (column.type === "Field") {
+        const f = fields.find((fld) => fld.name === column.field_name);
+        if (f) {
+          f.fieldview = column.fieldview;
+          if (f.type === "Key") {
+            if (getState().keyFieldviews[column.fieldview])
+              f.fieldviewObj = getState().keyFieldviews[column.fieldview];
+            f.input_type =
+              !f.fieldview || !f.fieldviewObj || f.fieldview === "select"
+                ? "select"
+                : "fromtype";
+          }
+          return f;
+        }
+      }
+    })
+    .filter((tf) => !!tf);
+
+  const form = new Form({
+    action: `/auth/signup_final`,
+    fields: tfields,
+    layout,
+    submitLabel: req.__("Sign up"),
+  });
+  await form.fill_fkey_options();
+  if (askEmail) {
+    form.fields.push(
+      new Field({
+        name: "email",
+        label: req.__("Email"),
+        type: "String",
+        required: true,
+      })
+    );
+    form.layout = {
+      above: [
+        {
+          type: "blank",
+          contents: "Email",
+        },
+        {
+          type: "field",
+          fieldview: "edit",
+          field_name: "email",
+        },
+        {
+          type: "line_break",
+        },
+        form.layout,
+      ],
+    };
+  } else {
+    form.hidden("email");
+  }
+  form.hidden("password");
+  return form;
+};
+
+const signup_login_with_user = (u, req, res) =>
+  req.login(
+    {
+      email: u.email,
+      id: u.id,
+      role_id: u.role_id,
+      tenant: db.getTenantSchema(),
+    },
+    function (err) {
+      if (!err) {
+        res.redirect("/");
+      } else {
+        req.flash("danger", err);
+        res.redirect("/auth/signup");
+      }
+    }
+  );
+
+router.get(
+  "/signup_final_ext",
+  setTenant,
+  error_catcher(async (req, res) => {
+    const new_user_form = getState().getConfig("new_user_form");
+    if (!req.user || req.user.id || !new_user_form) {
+      req.flash("danger", req.__("This is the wrong place"));
+      res.redirect("/auth/login");
+      return;
+    }
+    const form = await getNewUserForm(new_user_form, req, !req.user.email);
+    form.action = "/auth/signup_final_ext";
+    form.values.email = req.user.email;
+    res.sendAuthWrap(new_user_form, form, getAuthLinks("signup", true));
+  })
+);
+
+router.post(
+  "/signup_final_ext",
+  setTenant,
+  error_catcher(async (req, res) => {
+    const new_user_form = getState().getConfig("new_user_form");
+    if (!req.user || req.user.id || !new_user_form) {
+      req.flash("danger", req.__("This is the wrong place"));
+      res.redirect("/auth/login");
+      return;
+    }
+    const form = await getNewUserForm(new_user_form, req, !req.user.email);
+    form.action = "/auth/signup_final_ext";
+
+    form.validate(req.body);
+    if (form.hasErrors) {
+      res.sendAuthWrap(new_user_form, form, getAuthLinks("signup", true));
+      return;
+    }
+    try {
+      const uobj = { ...req.user, ...form.values };
+      if (uobj.email &amp;&amp; !check_email_mask(uobj.email)) {
+        form.errors._form = req.__(
+          "Signups with this email address are not accepted"
+        );
+        res.sendAuthWrap(new_user_form, form, getAuthLinks("signup", true));
+        return;
+      }
+      const u = await User.create(uobj);
+      await send_verification_email(u, req);
+
+      signup_login_with_user(u, req, res);
+    } catch (e) {
+      const table = await Table.findOne({ name: "users" });
+      const fields = await table.getFields();
+      form.hasErrors = true;
+      const unique_field_error = fields.find(
+        (f) =>
+          e.message ===
+          `duplicate key value violates unique constraint "users_${f.name}_unique"`
+      );
+      if (unique_field_error)
+        form.errors[unique_field_error.name] = req.__("Already in use");
+      else form.errors._form = e.message;
+      res.sendAuthWrap(new_user_form, form, getAuthLinks("signup", true));
+    }
+  })
+);
+router.post(
+  "/signup_final",
+  setTenant,
+  error_catcher(async (req, res) => {
+    if (getState().getConfig("allow_signup")) {
+      const new_user_form = getState().getConfig("new_user_form");
+      const form = await getNewUserForm(new_user_form, req);
+      const signup_form_name = getState().getConfig("signup_form", "");
+      if (signup_form_name) {
+        const signup_form = await View.findOne({ name: signup_form_name });
+        if (signup_form) {
+          signup_form.configuration.columns.forEach((col) => {
+            if (
+              col.type === "Field" &amp;&amp;
+              !["email", "password"].includes(col.field_name)
+            ) {
+              form.hidden(col.field_name);
+            }
+          });
+        }
+      }
+      form.validate(req.body);
+      if (form.hasErrors) {
+        res.sendAuthWrap(new_user_form, form, getAuthLinks("signup", true));
+      } else if (form.values.email &amp;&amp; !check_email_mask(form.values.email)) {
+        form.errors._form = req.__(
+          "Signups with this email address are not accepted"
+        );
+        res.sendAuthWrap(new_user_form, form, getAuthLinks("signup", true));
+      } else {
+        try {
+          const u = await User.create(form.values);
+          await send_verification_email(u, req);
+
+          signup_login_with_user(u, req, res);
+        } catch (e) {
+          const table = await Table.findOne({ name: "users" });
+          const fields = await table.getFields();
+          form.hasErrors = true;
+          const unique_field_error = fields.find(
+            (f) =>
+              e.message ===
+              `duplicate key value violates unique constraint "users_${f.name}_unique"`
+          );
+          if (unique_field_error)
+            form.errors[unique_field_error.name] = req.__("Already in use");
+          else form.errors._form = e.message;
+          res.sendAuthWrap(new_user_form, form, getAuthLinks("signup", true));
+        }
+      }
+    } else {
+      req.flash("danger", req.__("Signups not enabled"));
+      res.redirect("/auth/login");
+    }
+  })
+);
+
+router.post(
+  "/signup",
+  setTenant,
+  error_catcher(async (req, res) => {
+    if (!getState().getConfig("allow_signup")) {
+      req.flash("danger", req.__("Signups not enabled"));
+      res.redirect("/auth/login");
+      return;
+    }
+
+    const unsuitableEmailPassword = async (email, password, passwordRepeat) => {
+      if (!email || !password) {
+        req.flash("danger", req.__("E-mail and password required"));
+        res.redirect("/auth/signup");
+        return true;
+      }
+      if (email.length > 127) {
+        req.flash("danger", req.__("E-mail too long"));
+        res.redirect("/auth/signup");
+        return true;
+      }
+      if (!User.valid_email(email)) {
+        req.flash("danger", req.__("Not a valid e-mail address"));
+        res.redirect("/auth/signup");
+        return true;
+      }
+      if (!check_email_mask(email)) {
+        req.flash(
+          "danger",
+          req.__("Signups with this email address are not accepted")
+        );
+        res.redirect("/auth/signup");
+        return true;
+      }
+      if (typeof passwordRepeat === "string" &amp;&amp; password !== passwordRepeat) {
+        req.flash("danger", req.__("Passwords do not match"));
+        res.redirect("/auth/signup");
+        return true;
+      }
+
+      const us = await User.find({ email });
+      if (us.length > 0) {
+        req.flash("danger", req.__("Account already exists"));
+        res.redirect("/auth/signup");
+        return true;
+      }
+      const pwcheck = User.unacceptable_password_reason(password);
+      if (pwcheck) {
+        req.flash("danger", pwcheck);
+        res.redirect("/auth/signup");
+        return true;
+      }
+    };
+    const new_user_form = getState().getConfig("new_user_form");
+
+    const signup_form_name = getState().getConfig("signup_form", "");
+    if (signup_form_name) {
+      const signup_form = await View.findOne({ name: signup_form_name });
+      if (signup_form) {
+        const userObject = {};
+        signup_form.configuration.columns.forEach((col) => {
+          if (col.type === "Field") {
+            if (col.field_name === "passwordRepeat")
+              userObject[col.field_name] = req.body[col.field_name] || "";
+            else userObject[col.field_name] = req.body[col.field_name];
+          }
+        });
+        const { email, password, passwordRepeat } = userObject;
+        if (await unsuitableEmailPassword(email, password, passwordRepeat))
+          return;
+        if (new_user_form) {
+          const form = await getNewUserForm(new_user_form, req);
+          Object.entries(userObject).forEach(([k, v]) => {
+            form.values[k] = v;
+            if (!form.fields.find((f) => f.name === k)) form.hidden(k);
+          });
+          res.sendAuthWrap(new_user_form, form, getAuthLinks("signup", true));
+        } else {
+          const u = await User.create(userObject);
+          await send_verification_email(u, req);
+
+          signup_login_with_user(u, req, res);
+        }
+        return;
+      }
+    }
+
+    const form = loginForm(req, true);
+    form.validate(req.body);
+
+    if (form.hasErrors) {
+      form.action = "/auth/signup";
+      form.submitLabel = req.__("Sign up");
+      res.sendAuthWrap(req.__(`Sign up`), form, getAuthLinks("signup"));
+    } else {
+      const { email, password } = form.values;
+      if (await unsuitableEmailPassword(email, password)) return;
+      if (new_user_form) {
+        const form = await getNewUserForm(new_user_form, req);
+        form.values.email = email;
+        form.values.password = password;
+        res.sendAuthWrap(new_user_form, form, getAuthLinks("signup", true));
+      } else {
+        const u = await User.create({ email, password });
+        await send_verification_email(u, req);
+
+        signup_login_with_user(u, req, res);
+      }
+    }
+  })
+);
+
+function handler(req, res) {
+  console.log(
+    `Failed login attempt for: ${req.body.email} from ${req.ip} UA ${req.get(
+      "User-Agent"
+    )}`
+  );
+  req.flash(
+    "error",
+    "You've made too many failed attempts in a short period of time, please try again " +
+      moment(req.rateLimit.resetTime).fromNow()
+  );
+  res.redirect("/auth/login"); // brute force protection triggered, send them back to the login page
+}
+// try to find a unique user id in login submit
+const userIdKey = (body) => {
+  if (body.email) return body.email;
+  const { remember, password, _csrf, passwordRepeat, ...rest } = body;
+  const kvs = Object.entries(rest);
+  if (kvs.length > 0) return kvs[0][1];
+  else return "nokey";
+};
+const ipLimiter = rateLimit({
+    // TBD create config parameter
+  windowMs: 60 * 60 * 1000, // 60 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  handler,
+});
+
+const userLimiter = rateLimit({
+    // TBD create config parameter
+  windowMs: 5 * 60 * 1000, // 5 minutes
+  max: 3, // limit each IP to 100 requests per windowMs
+  keyGenerator: (req) => userIdKey(req.body),
+  handler,
+});
+
+router.post(
+  "/login",
+  setTenant,
+  ipLimiter,
+  userLimiter,
+  passport.authenticate("local", {
+    //successRedirect: "/",
+    failureRedirect: "/auth/login",
+    failureFlash: true,
+  }),
+  error_catcher(async (req, res) => {
+    ipLimiter.resetKey(req.ip);
+    userLimiter.resetKey(userIdKey(req.body));
+    if (req.session.cookie)
+      if (req.body.remember) {
+          // TBD create config parameter
+        req.session.cookie.maxAge = 30 * 24 * 60 * 60 * 1000; // Cookie expires after 30 days
+      } else {
+        req.session.cookie.expires = false; // Cookie expires at end of session
+      }
+    req.flash("success", req.__("Welcome, %s!", req.user.email));
+    res.redirect("/");
+  })
+);
+router.get(
+  "/login-with/:method",
+  setTenant,
+  error_catcher(async (req, res, next) => {
+    const { method } = req.params;
+    const auth = getState().auth_methods[method];
+    if (auth) {
+      passport.authenticate(method, auth.parameters)(req, res, next);
+    } else {
+      req.flash(
+        "danger",
+        req.__("Unknown authentication method %s", text(method))
+      );
+      res.redirect("/");
+    }
+  })
+);
+router.post(
+  "/login-with/:method",
+  setTenant,
+  error_catcher(async (req, res, next) => {
+    const { method } = req.params;
+    const auth = getState().auth_methods[method];
+    console.log(method, auth);
+    if (auth) {
+      passport.authenticate(method, auth.parameters)(
+        req,
+        res,
+        loginCallback(req, res)
+      );
+    } else {
+      req.flash(
+        "danger",
+        req.__("Unknown authentication method %s", text(method))
+      );
+      res.redirect("/");
+    }
+  })
+);
+
+const loginCallback = (req, res) => () => {
+  if (!req.user) return;
+  if (!req.user.id) {
+    res.redirect("/auth/signup_final_ext");
+  }
+  if (!req.user.email) {
+    res.redirect("/auth/set-email");
+  } else {
+    req.flash("success", req.__("Welcome, %s!", req.user.email));
+    res.redirect("/");
+  }
+};
+
+router.get(
+  "/callback/:method",
+  setTenant,
+  error_catcher(async (req, res, next) => {
+    const { method } = req.params;
+    const auth = getState().auth_methods[method];
+    if (auth) {
+      passport.authenticate(method, { failureRedirect: "/auth/login" })(
+        req,
+        res,
+        loginCallback(req, res)
+      );
+    }
+  })
+);
+
+const changPwForm = (req) =>
+  new Form({
+    action: "/auth/settings",
+    submitLabel: req.__("Change"),
+    submitButtonClass: "btn-outline-primary",
+    onChange: "remove_outline(this)",
+    fields: [
+      {
+        label: req.__("Old password"),
+        name: "password",
+        input_type: "password",
+      },
+      {
+        label: req.__("New password"),
+        name: "new_password",
+        input_type: "password",
+        validator: (pw) => User.unacceptable_password_reason(pw),
+      },
+    ],
+  });
+const setLanguageForm = (req, user) =>
+  form(
+    {
+      action: `/auth/setlanguage/`,
+      method: "post",
+    },
+    csrfField(req.csrfToken()),
+    select(
+      { name: "locale", onchange: "form.submit()" },
+      Object.entries(available_languages).map(([locale, language]) =>
+        option(
+          {
+            value: locale,
+            ...(user &amp;&amp; user.language === locale &amp;&amp; { selected: true }),
+          },
+          language
+        )
+      )
+    )
+  );
+
+const userSettings = async ({ req, res, pwform, user }) => {
+  let usersets;
+  const user_settings_form = getState().getConfig("user_settings_form", "");
+  if (user_settings_form) {
+    const view = await View.findOne({ name: user_settings_form });
+    if (view) {
+      usersets = await view.run({ id: user.id }, { req, res });
+    }
+  }
+
+  return {
+    above: [
+      {
+        type: "breadcrumbs",
+        crumbs: [{ text: req.__("User") }, { text: req.__("Settings") }],
+      },
+      {
+        type: "card",
+        title: req.__("User"),
+        contents: table(
+          tbody(
+            tr(th(req.__("Email: ")), td(a({ href: 'mailto:'+req.user.email  }, req.user.email))),
+            tr(th(req.__("Language: ")), td(setLanguageForm(req, user)))
+          )
+        ),
+      },
+      ...(usersets
+        ? [
+            {
+              type: "card",
+              title: req.__("User Settings"),
+              contents: usersets,
+            },
+          ]
+        : []),
+      {
+        type: "card",
+        title: req.__("Change password"),
+        contents: renderForm(pwform, req.csrfToken()),
+      },
+    ],
+  };
+};
+/**
+ * Set language
+ */
+router.post(
+  "/setlanguage",
+  setTenant,
+  loggedIn,
+  error_catcher(async (req, res) => {
+    const u = await User.findOne({ id: req.user.id });
+    const newlang = available_languages[req.body.locale];
+    if (newlang) {
+      await u.set_language(req.body.locale);
+      req.login(
+        {
+          email: u.email,
+          id: u.id,
+          role_id: u.role_id,
+          language: req.body.locale,
+          tenant: db.getTenantSchema(),
+        },
+        function (err) {
+          if (!err) {
+            req.flash("success", req.__("Language changed to %s", newlang));
+            res.redirect("/auth/settings");
+          } else {
+            req.flash("danger", err);
+            res.redirect("/auth/settings");
+          }
+        }
+      );
+    } else {
+      req.flash("danger", req.__("Language not found"));
+      res.redirect("/auth/settings");
+    }
+  })
+);
+router.get(
+  "/settings",
+  setTenant,
+  loggedIn,
+  error_catcher(async (req, res) => {
+    const user = await User.findOne({ id: req.user.id });
+    res.sendWrap(
+      req.__("User settings"),
+      await userSettings({ req, res, pwform: changPwForm(req), user })
+    );
+  })
+);
+/**
+ * Define set email form for user
+ * @param req
+ * @returns {Form}
+ */
+const setEmailForm = (req) =>
+  new Form({
+    action: "/auth/set-email",
+    blurb: req.__("Please enter your email address"),
+    fields: [
+      { name: "email", label: req.__("Email"), type: "String", required: true },
+    ],
+  });
+/**
+ * Render form for set email for user
+ */
+router.get(
+  "/set-email",
+  setTenant,
+  error_catcher(async (req, res) => {
+    res.sendWrap(
+      req.__("Set Email"),
+      renderForm(setEmailForm(req), req.csrfToken())
+    );
+  })
+);
+/**
+ * Execute set email for user
+ */
+router.post(
+  "/set-email",
+  setTenant,
+  error_catcher(async (req, res) => {
+    const form = setEmailForm(req);
+    form.validate(req.body);
+    if (form.hasErrors || !req.user || !req.user.id) {
+      res.sendWrap(req.__("Set Email"), renderForm(form, req.csrfToken()));
+      return;
+    }
+    const existing = await User.findOne({ email: form.values.email });
+    if (existing) {
+      form.hasErrors = true;
+      form.errors.email = req.__(
+        "A user with this email address already exists"
+      );
+      res.sendWrap(req.__("Set Email"), renderForm(form, req.csrfToken()));
+      return;
+    }
+
+    const u = await User.findOne({ id: req.user.id });
+    await u.update({ email: form.values.email });
+    u.email = form.values.email;
+    req.login(
+      {
+        email: u.email,
+        id: u.id,
+        role_id: u.role_id,
+        tenant: db.getTenantSchema(),
+      },
+      function (err) {
+        if (!err) {
+          req.flash("success", req.__("Welcome, %s!", u.email));
+          res.redirect("/");
+        } else {
+          req.flash("danger", err);
+          res.redirect("/");
+        }
+      }
+    );
+  })
+);
+/**
+ * Execute Change Password for User
+ */
+router.post(
+  "/settings",
+  setTenant,
+  loggedIn,
+  error_catcher(async (req, res) => {
+    const user = await User.findOne({ id: req.user.id });
+    if (req.body.new_password) {
+      const pwform = changPwForm(req);
+
+      pwform.fields[0].validator = (oldpw) => {
+        const cmp = user.checkPassword(oldpw);
+        if (cmp) return true;
+        else return req.__("Password does not match");
+      };
+
+      pwform.validate(req.body);
+
+      if (pwform.hasErrors) {
+        res.sendWrap(
+          req.__("User settings"),
+          await userSettings({ req, res, pwform, user })
+        );
+      } else {
+        await user.changePasswordTo(pwform.values.new_password);
+        req.flash("success", req.__("Password changed"));
+        res.redirect("/auth/settings");
+      }
+    } else {
+      const user_settings_form = getState().getConfig("user_settings_form", "");
+      if (user_settings_form) {
+        const view = await View.findOne({ name: user_settings_form });
+        if (view) {
+          await view.runPost({ id: user.id }, req.body, {
+            req,
+            res,
+            redirect: "/auth/settings",
+          });
+          req.flash("success", req.__("User settings changed"));
+        }
+      } else {
+        res.redirect("/auth/settings");
+      }
+    }
+  })
+);
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Classes</h3><ul><li><a href="Field.html">Field</a></li><li><a href="File.html">File</a></li><li><a href="Page.html">Page</a></li><li><a href="Plugin.html">Plugin</a></li><li><a href="PluginsCommand.html">PluginsCommand</a></li><li><a href="State.html">State</a></li><li><a href="Table.html">Table</a></li><li><a href="Trigger.html">Trigger</a></li><li><a href="User.html">User</a></li><li><a href="global.html#View">View</a></li></ul><h3>Global</h3><ul><li><a href="global.html#add_unique_constraint">add_unique_constraint</a></li><li><a href="global.html#addOrCreateList">addOrCreateList</a></li><li><a href="global.html#bool">bool</a></li><li><a href="global.html#calcfldViewConfig">calcfldViewConfig</a></li><li><a href="global.html#calcfldViewOptions">calcfldViewOptions</a></li><li><a href="global.html#changeConnection">changeConnection</a></li><li><a href="global.html#check_email_mask">check_email_mask</a></li><li><a href="global.html#close">close</a></li><li><a href="global.html#color">color</a></li><li><a href="global.html#configFileDir">configFileDir</a></li><li><a href="global.html#configFilePath">configFilePath</a></li><li><a href="global.html#configTypes">configTypes</a></li><li><a href="global.html#constraintForm">constraintForm</a></li><li><a href="global.html#copyFrom">copyFrom</a></li><li><a href="global.html#copyFrom1">copyFrom1</a></li><li><a href="global.html#count">count</a></li><li><a href="global.html#create_blank_migration">create_blank_migration</a></li><li><a href="global.html#create_tenant">create_tenant</a></li><li><a href="global.html#create_tenant_allowed">create_tenant_allowed</a></li><li><a href="global.html#createTenant">createTenant</a></li><li><a href="global.html#date">date</a></li><li><a href="global.html#db">db</a></li><li><a href="global.html#defaultDataPath">defaultDataPath</a></li><li><a href="global.html#deleteConfig">deleteConfig</a></li><li><a href="global.html#deleteTenant">deleteTenant</a></li><li><a href="global.html#deleteWhere">deleteWhere</a></li><li><a href="global.html#discover_tables">discover_tables</a></li><li><a href="global.html#discoverable_tables">discoverable_tables</a></li><li><a href="global.html#discoverForm">discoverForm</a></li><li><a href="global.html#domain_sanitize">domain_sanitize</a></li><li><a href="global.html#drop_reset_schema">drop_reset_schema</a></li><li><a href="global.html#drop_unique_constraint">drop_unique_constraint</a></li><li><a href="global.html#eachTenant">eachTenant</a></li><li><a href="global.html#email_form">email_form</a></li><li><a href="global.html#ensure_final_slash">ensure_final_slash</a></li><li><a href="global.html#express">express</a></li><li><a href="global.html#fetch">fetch</a></li><li><a href="global.html#field_picker_fields">field_picker_fields</a></li><li><a href="global.html#findType">findType</a></li><li><a href="global.html#float">float</a></li><li><a href="global.html#fs">fs</a></li><li><a href="global.html#get_base_url">get_base_url</a></li><li><a href="global.html#get_child_views">get_child_views</a></li><li><a href="global.html#get_db_filepath">get_db_filepath</a></li><li><a href="global.html#get_domain">get_domain</a></li><li><a href="global.html#get_existing_views">get_existing_views</a></li><li><a href="global.html#get_latest_npm_version">get_latest_npm_version</a></li><li><a href="global.html#get_link_view_opts">get_link_view_opts</a></li><li><a href="global.html#get_other_domain_tenant">get_other_domain_tenant</a></li><li><a href="global.html#get_parent_views">get_parent_views</a></li><li><a href="global.html#get_process_init_time">get_process_init_time</a></li><li><a href="global.html#get_sql_logging">get_sql_logging</a></li><li><a href="global.html#get_tenant_info">get_tenant_info</a></li><li><a href="global.html#getActionConfigFields">getActionConfigFields</a></li><li><a href="global.html#getAllConfig">getAllConfig</a></li><li><a href="global.html#getAllConfigOrDefaults">getAllConfigOrDefaults</a></li><li><a href="global.html#getAllTenants">getAllTenants</a></li><li><a href="global.html#getClient">getClient</a></li><li><a href="global.html#getConfig">getConfig</a></li><li><a href="global.html#getConfigFile">getConfigFile</a></li><li><a href="global.html#getConnectObject">getConnectObject</a></li><li><a href="global.html#getGitRevision">getGitRevision</a></li><li><a href="global.html#getNewURL">getNewURL</a></li><li><a href="global.html#getRootPageForm">getRootPageForm</a></li><li><a href="global.html#getTenant">getTenant</a></li><li><a href="global.html#getVersion">getVersion</a></li><li><a href="global.html#implement_discovery">implement_discovery</a></li><li><a href="global.html#init_multi_tenant">init_multi_tenant</a></li><li><a href="global.html#initial_config_all_fields">initial_config_all_fields</a></li><li><a href="global.html#insert">insert</a></li><li><a href="global.html#int">int</a></li><li><a href="global.html#is_ip_address">is_ip_address</a></li><li><a href="global.html#is_sqlite">is_sqlite</a></li><li><a href="global.html#isDate">isDate</a></li><li><a href="global.html#isFixedConfig">isFixedConfig</a></li><li><a href="global.html#jsgrid_controller">jsgrid_controller</a></li><li><a href="global.html#json_list_to_external_table">json_list_to_external_table</a></li><li><a href="global.html#link_view">link_view</a></li><li><a href="global.html#migrate">migrate</a></li><li><a href="global.html#moment">moment</a></li><li><a href="global.html#normalise_error_message">normalise_error_message</a></li><li><a href="global.html#path">path</a></li><li><a href="global.html#picked_fields_to_query">picked_fields_to_query</a></li><li><a href="global.html#post_delete_btn">post_delete_btn</a></li><li><a href="global.html#readState">readState</a></li><li><a href="global.html#readStateStrict">readStateStrict</a></li><li><a href="global.html#recalculate_for_stored">recalculate_for_stored</a></li><li><a href="global.html#remove_from_menu">remove_from_menu</a></li><li><a href="global.html#renameForm">renameForm</a></li><li><a href="global.html#reprAsJson">reprAsJson</a></li><li><a href="global.html#reset_sequence">reset_sequence</a></li><li><a href="global.html#restart_tenant">restart_tenant</a></li><li><a href="global.html#Router">Router</a></li><li><a href="global.html#run_action_column">run_action_column</a></li><li><a href="global.html#runScheduler">runScheduler</a></li><li><a href="global.html#select">select</a></li><li><a href="global.html#selectMaybeOne">selectMaybeOne</a></li><li><a href="global.html#selectOne">selectOne</a></li><li><a href="global.html#set_multitenancy_cfg">set_multitenancy_cfg</a></li><li><a href="global.html#set_sql_logging">set_sql_logging</a></li><li><a href="global.html#set_tenant_base_url">set_tenant_base_url</a></li><li><a href="global.html#setConfig">setConfig</a></li><li><a href="global.html#setEmailForm">setEmailForm</a></li><li><a href="global.html#sql_log">sql_log</a></li><li><a href="global.html#sqlsanitize">sqlsanitize</a></li><li><a href="global.html#sqlsanitizeAllowDots">sqlsanitizeAllowDots</a></li><li><a href="global.html#stateFieldsToQuery">stateFieldsToQuery</a></li><li><a href="global.html#stateFieldsToWhere">stateFieldsToWhere</a></li><li><a href="global.html#strictParseInt">strictParseInt</a></li><li><a href="global.html#string">string</a></li><li><a href="global.html#table">table</a></li><li><a href="global.html#tableBadges">tableBadges</a></li><li><a href="global.html#tableForm">tableForm</a></li><li><a href="global.html#tenant_form">tenant_form</a></li><li><a href="global.html#transposeObjects">transposeObjects</a></li><li><a href="global.html#triggerForm">triggerForm</a></li><li><a href="global.html#typeToJsGridType">typeToJsGridType</a></li><li><a href="global.html#update">update</a></li><li><a href="global.html#user_dropdown">user_dropdown</a></li><li><a href="global.html#versionsField">versionsField</a></li><li><a href="global.html#whereFTS">whereFTS</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.7</a> on Sat Jun 19 2021 10:29:18 GMT+0100 (British Summer Time)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

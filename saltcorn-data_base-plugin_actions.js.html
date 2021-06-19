@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: saltcorn-data/base-plugin/actions.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: saltcorn-data/base-plugin/actions.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>/**
+ * Action description
+ *
+ */
+
+const fetch = require("node-fetch");
+const vm = require("vm");
+const Table = require("../models/table");
+const View = require("../models/view");
+const { getState } = require("../db/state");
+const User = require("../models/user");
+const {
+  getMailTransport,
+  transformBootstrapEmail,
+} = require("../models/email");
+const { mockReqRes } = require("../tests/mocks");
+const { get_async_expression_function } = require("../models/expression");
+const { div, code } = require("@saltcorn/markup/tags");
+
+//action use cases: field modify, like/rate (insert join), notify, send row to webhook
+// todo add translation
+module.exports = {
+  webhook: {
+    configFields: [
+      { name: "url", label: "URL", type: "String", sublabel: "Trigger will call specified URL" },
+      {
+        name: "body",
+        label: "JSON body",
+        sublabel: "Leave blank to use row from table",
+        type: "String",
+        fieldview: "textarea", // I think that textarea is better
+      },
+    ],
+    run: async ({ row, configuration: { url, body } }) => {
+      return await fetch(url, {
+        method: "post",
+        body: body || JSON.stringify(row),
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  },
+  send_email: {
+    configFields: async ({ table }) => {
+      if (!table) return [];
+      const views = await View.find_table_views_where(
+        table,
+        ({ viewtemplate }) => viewtemplate.runMany || viewtemplate.renderRows
+      );
+
+      const view_opts = views.map((v) => v.name);
+      const fields = await table.getFields();
+      const field_opts = fields
+        .filter((f) => f.type.name === "String" || f.reftable_name === "users")
+        .map((f) => f.name);
+      return [
+        {
+          name: "viewname",
+          label: "View to send",
+          sublabel:
+            "Select a view that can render a single record - for instance, of the Show template.",
+          input_type: "select",
+          options: view_opts,
+        },
+        {
+          name: "to_email",
+          label: "Recipient email address",
+          sublabel: "Select email addresses for send email. Choose option to get more information",
+          input_type: "select",
+          required: true,
+
+          options: ["Fixed", "User", "Field"],
+        },
+        {
+          name: "to_email_field",
+          label: "Field with email address",
+          sublabel:
+            "Field with email address a String, or Key to user who will receive email",
+          input_type: "select",
+
+          options: field_opts,
+
+          showIf: { to_email: "Field" },
+        },
+        {
+          name: "to_email_fixed",
+          label: "Fixed address",
+          sublabel: "Email address to send emails", // todo send to few addresses?
+          type: "String",
+          showIf: { to_email: "Fixed" },
+        },
+        {
+          name: "subject",
+          label: "Subject",
+          sublabel: "Subject of email",
+          type: "String",
+          required: true,
+        },
+      ];
+    },
+    requireRow: true,
+    run: async ({
+      row,
+      table,
+      configuration: {
+        viewname,
+        subject,
+        to_email,
+        to_email_field,
+        to_email_fixed,
+      },
+      user,
+    }) => {
+      let to_addr;
+      switch (to_email) {
+        case "Fixed":
+          to_addr = to_email_fixed;
+          break;
+        case "User":
+          to_addr = user.email;
+          break;
+        case "Field":
+          const fields = await table.getFields();
+          const field = fields.find((f) => f.name === to_email_field);
+          if (field &amp;&amp; field.type.name === "String")
+            to_addr = row[to_email_field];
+          else if (field &amp;&amp; field.reftable_name === "users") {
+            const refuser = await User.findOne({ id: row[to_email_field] });
+            to_addr = refuser.email;
+          }
+          break;
+      }
+      const view = await View.findOne({ name: viewname });
+      const htmlBs = await view.run({ id: row.id }, mockReqRes);
+      const html = await transformBootstrapEmail(htmlBs);
+      console.log("Sending email from %s to %s with subject %s to_email",
+          getState().getConfig("email_from"), to_addr, subject, to_addr);
+      const email = {
+        from: getState().getConfig("email_from"),
+        to: to_addr,
+        subject,
+        html,
+      };
+      //console.log(email);
+      await getMailTransport().sendMail(email);
+      return { notify: `E-mail sent to ${to_addr}` };
+    },
+  },
+  insert_joined_row: {
+    configFields: async ({ table }) => {
+      if (!table) return [];
+      const { child_field_list } = await table.get_child_relations();
+      return [
+        {
+          name: "joined_table",
+          label: "Relation",
+          sublabel: "Relation", // todo more detailed explanation
+          input_type: "select",
+          options: child_field_list,
+        },
+      ];
+    },
+    requireRow: true,
+    run: async ({ row, table, configuration: { joined_table }, user }) => {
+      const [join_table_name, join_field] = joined_table.split(".");
+      const joinTable = await Table.findOne({ name: join_table_name });
+      const fields = await joinTable.getFields();
+      const newRow = { [join_field]: row.id };
+      for (const field of fields) {
+        if (
+          field.type === "Key" &amp;&amp;
+          field.reftable_name === "users" &amp;&amp;
+          user &amp;&amp;
+          user.id
+        )
+          newRow[field.name] = user.id;
+      }
+      return await joinTable.insertRow(newRow);
+    },
+  },
+  duplicate_row: {
+    configFields: () => [],
+    requireRow: true,
+    run: async ({ row, table, user }) => {
+      const newRow = { ...row };
+      await table.getFields();
+      delete newRow[table.pk_name];
+      await table.insertRow(newRow);
+      return { reload_page: true };
+    },
+  },
+  insert_any_row: {
+    configFields: async ({ table }) => {
+      const tables = await Table.find();
+      return [
+        {
+          name: "table",
+          label: "Table",
+          sublabel: "Table", //todo more detailed explanation
+          input_type: "select",
+          options: tables.map((t) => t.name),
+        },
+        {
+          name: "row_expr",
+          label: "Row expression",
+          sublabel: "Expression for JavaScript object",
+          type: "String",
+          fieldview: "textarea",
+        },
+      ];
+    },
+    run: async ({ row, configuration: { row_expr, table }, user, ...rest }) => {
+      const f = get_async_expression_function(row_expr, [], {
+        row: row || {},
+        user,
+        console,
+      });
+      const calcrow = await f({});
+      const table_for_insert = await Table.findOne({ name: table });
+      const res = await table_for_insert.tryInsertRow(calcrow, user &amp;&amp; user.id);
+      if (res.error) return res;
+      else return true;
+    },
+  },
+  run_js_code: {
+    configFields: async ({ table }) => {
+      const fields = table ? (await table.getFields()).map((f) => f.name) : [];
+      const vars = [      
+        ...(table ? ["row"] : []),
+        "user",
+        "console",
+        "Actions",
+        "Table",
+        ...(table ? ["table"] : []),
+        ...fields,
+      ]
+        .map((f) => code(f))
+        .join(", ");
+      return [
+        {
+          name: "code",
+          label: "Code",
+          input_type: "code",
+          attributes: { mode: "application/javascript" },
+          sublabel: div("Variables in scope: ", vars),
+        },
+      ];
+    },
+    run: async ({ row, table, configuration: { code }, user, ...rest }) => {
+      const Actions = {};
+      Object.entries(getState().actions).forEach(([k, v]) => {
+        Actions[k] = (args = {}) => {
+          v.run({ row, table, user, configuration: args, ...rest, ...args });
+        };
+      });
+      const f = vm.runInNewContext(`async () => {${code}}`, {
+        Table,
+        table,
+        row,
+        user,
+        console,
+        Actions,
+        ...(row || {}),
+        ...getState().function_context,
+        ...rest,
+      });
+      return await f();
+    },
+  },
+};
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Classes</h3><ul><li><a href="Field.html">Field</a></li><li><a href="File.html">File</a></li><li><a href="Page.html">Page</a></li><li><a href="Plugin.html">Plugin</a></li><li><a href="PluginsCommand.html">PluginsCommand</a></li><li><a href="State.html">State</a></li><li><a href="Table.html">Table</a></li><li><a href="Trigger.html">Trigger</a></li><li><a href="User.html">User</a></li><li><a href="global.html#View">View</a></li></ul><h3>Global</h3><ul><li><a href="global.html#add_unique_constraint">add_unique_constraint</a></li><li><a href="global.html#addOrCreateList">addOrCreateList</a></li><li><a href="global.html#bool">bool</a></li><li><a href="global.html#calcfldViewConfig">calcfldViewConfig</a></li><li><a href="global.html#calcfldViewOptions">calcfldViewOptions</a></li><li><a href="global.html#changeConnection">changeConnection</a></li><li><a href="global.html#check_email_mask">check_email_mask</a></li><li><a href="global.html#close">close</a></li><li><a href="global.html#color">color</a></li><li><a href="global.html#configFileDir">configFileDir</a></li><li><a href="global.html#configFilePath">configFilePath</a></li><li><a href="global.html#configTypes">configTypes</a></li><li><a href="global.html#constraintForm">constraintForm</a></li><li><a href="global.html#copyFrom">copyFrom</a></li><li><a href="global.html#copyFrom1">copyFrom1</a></li><li><a href="global.html#count">count</a></li><li><a href="global.html#create_blank_migration">create_blank_migration</a></li><li><a href="global.html#create_tenant">create_tenant</a></li><li><a href="global.html#create_tenant_allowed">create_tenant_allowed</a></li><li><a href="global.html#createTenant">createTenant</a></li><li><a href="global.html#date">date</a></li><li><a href="global.html#db">db</a></li><li><a href="global.html#defaultDataPath">defaultDataPath</a></li><li><a href="global.html#deleteConfig">deleteConfig</a></li><li><a href="global.html#deleteTenant">deleteTenant</a></li><li><a href="global.html#deleteWhere">deleteWhere</a></li><li><a href="global.html#discover_tables">discover_tables</a></li><li><a href="global.html#discoverable_tables">discoverable_tables</a></li><li><a href="global.html#discoverForm">discoverForm</a></li><li><a href="global.html#domain_sanitize">domain_sanitize</a></li><li><a href="global.html#drop_reset_schema">drop_reset_schema</a></li><li><a href="global.html#drop_unique_constraint">drop_unique_constraint</a></li><li><a href="global.html#eachTenant">eachTenant</a></li><li><a href="global.html#email_form">email_form</a></li><li><a href="global.html#ensure_final_slash">ensure_final_slash</a></li><li><a href="global.html#express">express</a></li><li><a href="global.html#fetch">fetch</a></li><li><a href="global.html#field_picker_fields">field_picker_fields</a></li><li><a href="global.html#findType">findType</a></li><li><a href="global.html#float">float</a></li><li><a href="global.html#fs">fs</a></li><li><a href="global.html#get_base_url">get_base_url</a></li><li><a href="global.html#get_child_views">get_child_views</a></li><li><a href="global.html#get_db_filepath">get_db_filepath</a></li><li><a href="global.html#get_domain">get_domain</a></li><li><a href="global.html#get_existing_views">get_existing_views</a></li><li><a href="global.html#get_latest_npm_version">get_latest_npm_version</a></li><li><a href="global.html#get_link_view_opts">get_link_view_opts</a></li><li><a href="global.html#get_other_domain_tenant">get_other_domain_tenant</a></li><li><a href="global.html#get_parent_views">get_parent_views</a></li><li><a href="global.html#get_process_init_time">get_process_init_time</a></li><li><a href="global.html#get_sql_logging">get_sql_logging</a></li><li><a href="global.html#get_tenant_info">get_tenant_info</a></li><li><a href="global.html#getActionConfigFields">getActionConfigFields</a></li><li><a href="global.html#getAllConfig">getAllConfig</a></li><li><a href="global.html#getAllConfigOrDefaults">getAllConfigOrDefaults</a></li><li><a href="global.html#getAllTenants">getAllTenants</a></li><li><a href="global.html#getClient">getClient</a></li><li><a href="global.html#getConfig">getConfig</a></li><li><a href="global.html#getConfigFile">getConfigFile</a></li><li><a href="global.html#getConnectObject">getConnectObject</a></li><li><a href="global.html#getGitRevision">getGitRevision</a></li><li><a href="global.html#getNewURL">getNewURL</a></li><li><a href="global.html#getRootPageForm">getRootPageForm</a></li><li><a href="global.html#getTenant">getTenant</a></li><li><a href="global.html#getVersion">getVersion</a></li><li><a href="global.html#implement_discovery">implement_discovery</a></li><li><a href="global.html#init_multi_tenant">init_multi_tenant</a></li><li><a href="global.html#initial_config_all_fields">initial_config_all_fields</a></li><li><a href="global.html#insert">insert</a></li><li><a href="global.html#int">int</a></li><li><a href="global.html#is_ip_address">is_ip_address</a></li><li><a href="global.html#is_sqlite">is_sqlite</a></li><li><a href="global.html#isDate">isDate</a></li><li><a href="global.html#isFixedConfig">isFixedConfig</a></li><li><a href="global.html#jsgrid_controller">jsgrid_controller</a></li><li><a href="global.html#json_list_to_external_table">json_list_to_external_table</a></li><li><a href="global.html#link_view">link_view</a></li><li><a href="global.html#migrate">migrate</a></li><li><a href="global.html#moment">moment</a></li><li><a href="global.html#normalise_error_message">normalise_error_message</a></li><li><a href="global.html#path">path</a></li><li><a href="global.html#picked_fields_to_query">picked_fields_to_query</a></li><li><a href="global.html#post_delete_btn">post_delete_btn</a></li><li><a href="global.html#readState">readState</a></li><li><a href="global.html#readStateStrict">readStateStrict</a></li><li><a href="global.html#recalculate_for_stored">recalculate_for_stored</a></li><li><a href="global.html#remove_from_menu">remove_from_menu</a></li><li><a href="global.html#renameForm">renameForm</a></li><li><a href="global.html#reprAsJson">reprAsJson</a></li><li><a href="global.html#reset_sequence">reset_sequence</a></li><li><a href="global.html#restart_tenant">restart_tenant</a></li><li><a href="global.html#Router">Router</a></li><li><a href="global.html#run_action_column">run_action_column</a></li><li><a href="global.html#runScheduler">runScheduler</a></li><li><a href="global.html#select">select</a></li><li><a href="global.html#selectMaybeOne">selectMaybeOne</a></li><li><a href="global.html#selectOne">selectOne</a></li><li><a href="global.html#set_multitenancy_cfg">set_multitenancy_cfg</a></li><li><a href="global.html#set_sql_logging">set_sql_logging</a></li><li><a href="global.html#set_tenant_base_url">set_tenant_base_url</a></li><li><a href="global.html#setConfig">setConfig</a></li><li><a href="global.html#setEmailForm">setEmailForm</a></li><li><a href="global.html#sql_log">sql_log</a></li><li><a href="global.html#sqlsanitize">sqlsanitize</a></li><li><a href="global.html#sqlsanitizeAllowDots">sqlsanitizeAllowDots</a></li><li><a href="global.html#stateFieldsToQuery">stateFieldsToQuery</a></li><li><a href="global.html#stateFieldsToWhere">stateFieldsToWhere</a></li><li><a href="global.html#strictParseInt">strictParseInt</a></li><li><a href="global.html#string">string</a></li><li><a href="global.html#table">table</a></li><li><a href="global.html#tableBadges">tableBadges</a></li><li><a href="global.html#tableForm">tableForm</a></li><li><a href="global.html#tenant_form">tenant_form</a></li><li><a href="global.html#transposeObjects">transposeObjects</a></li><li><a href="global.html#triggerForm">triggerForm</a></li><li><a href="global.html#typeToJsGridType">typeToJsGridType</a></li><li><a href="global.html#update">update</a></li><li><a href="global.html#user_dropdown">user_dropdown</a></li><li><a href="global.html#versionsField">versionsField</a></li><li><a href="global.html#whereFTS">whereFTS</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.7</a> on Sat Jun 19 2021 10:29:18 GMT+0100 (British Summer Time)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: server/routes/actions.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: server/routes/actions.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>/**
+ * Actions (Triggers) Handler
+ *
+ */
+const Router = require("express-promise-router");
+const {
+    isAdmin,
+    setTenant,
+    error_catcher,
+    get_base_url,
+} = require("./utils.js");
+const {getState} = require("@saltcorn/data/db/state");
+const Trigger = require("@saltcorn/data/models/trigger");
+
+const router = new Router();
+module.exports = router;
+const {
+    mkTable,
+    renderForm,
+    link,
+    post_btn,
+    settingsDropdown,
+    post_dropdown_item,
+    post_delete_btn,
+} = require("@saltcorn/markup");
+const actions = require("@saltcorn/data/base-plugin/actions");
+const Form = require("@saltcorn/data/models/form");
+const {div, code, a, span} = require("@saltcorn/markup/tags");
+const Table = require("@saltcorn/data/models/table");
+const {getActionConfigFields} = require("@saltcorn/data/plugin-helper");
+const {send_events_page} = require("../markup/admin.js");
+
+const getActions = async () => {
+    return Object.entries(getState().actions).map(([k, v]) => {
+        const hasConfig = !!v.configFields;
+        return {
+            name: k,
+            hasConfig,
+        };
+    });
+};
+/**
+ * Actions (Trigger) List (GET)
+ */
+router.get(
+    "/",
+    setTenant,
+    isAdmin,
+    error_catcher(async (req, res) => {
+        const triggers = await Trigger.findAllWithTableName();
+        const actions = await getActions();
+        const base_url = get_base_url(req);
+        send_events_page({
+            res,
+            req,
+            active_sub: "Actions",
+            contents: {
+                above: [
+                    {
+                        type: "card",
+                        title: req.__("Actions available"),
+                        contents: div(
+                            actions
+                                .map((a) => span({class: "badge badge-primary"}, a.name))
+                                .join("&amp;nbsp;")
+                        ),
+                    },
+                    {
+                        type: "card",
+                        title: req.__("Triggers"),
+                        contents: div(
+                            mkTable(
+                                [
+                                    {label: req.__("Name"), key: "name",},
+                                    {label: req.__("Action"), key: "action",},
+                                    {label: req.__("Table"), key: "table_name",},
+                                    {
+                                        label: req.__("When"),
+                                        key: (a) =>
+                                            a.when_trigger === "API call"
+                                                ? `API: ${base_url}api/action/${a.name}`
+                                                : a.when_trigger,
+                                    },
+                                    {
+                                        label: req.__("Test run"),
+                                        key: (r) =>
+                                            r.table_id
+                                                ? ""
+                                                : link(`/actions/testrun/${r.id}`, req.__("Test run")),
+                                    },
+                                    {
+                                        label: req.__("Edit"),
+                                        key: (r) =>
+                                            link(`/actions/trigger/${r.id}`, req.__("Edit")),
+                                    },
+                                    {
+                                        label: req.__("Configure"),
+                                        key: (r) =>
+                                            link(`/actions/configure/${r.id}`, req.__("Configure")),
+                                    },
+                                    {
+                                        label: req.__("Delete"),
+                                        key: (r) => post_delete_btn(`/actions/delete/${r.id}`, req),
+                                    },
+                                ],
+                                triggers,
+                                {hover: true}
+                            ),
+                            link("/actions/trigger/new", req.__("Add trigger"))
+                        ),
+                    },
+                ],
+            },
+        });
+    })
+);
+/**
+ * Trigger Edit Form
+ * @param req
+ * @param trigger
+ * @returns {Promise&lt;Form>}
+ */
+const triggerForm = async (req, trigger) => {
+    const actions = await getActions();
+    const tables = await Table.find({});
+    let id;
+    let form_action;
+    if(typeof trigger!=="undefined") {
+        id=trigger.id;
+        form_action = `/actions/trigger/${id}`;
+    }
+    else form_action = "/actions/trigger";
+
+
+    const form = new Form({
+        action: form_action,
+        fields: [
+            {
+                name: "name",
+                label: req.__("Name"),
+                type: "String",
+                sublabel: req.__("Name of action"),
+            },
+            {
+                name: "description",
+                label: req.__("Description"),
+                type: "String",
+                sublabel: req.__("Description allows you to give more information about the action"),
+            },
+            {
+                name: "action",
+                label: req.__("Action"),
+                input_type: "select",
+                required: true,
+                options: actions.map((t) => ({value: t.name, label: t.name})),
+                sublabel: req.__("The action to be taken when the trigger fires"),
+            },
+            {
+                name: "when_trigger",
+                label: req.__("When"),
+                input_type: "select",
+                required: true,
+                options: Trigger.when_options.map((t) => ({value: t, label: t})),
+                sublabel: req.__("Condition under which the trigger will fire"),
+            },
+            {
+                name: "table_id",
+                label: req.__("Table"),
+                input_type: "select",
+                options: [...tables.map((t) => ({value: t.id, label: t.name}))],
+                showIf: {when_trigger: ["Insert", "Update", "Delete"]},
+                sublabel: req.__("The table for which the trigger condition is checked."),
+            },
+        ],
+    });
+   // if (trigger) {
+   //     form.hidden("id");
+   //     form.values = trigger;
+  //  }
+    return form;
+};
+/**
+ * Create new Trigger (get)
+ */
+router.get(
+    "/trigger/new",
+    setTenant,
+    isAdmin,
+    error_catcher(async (req, res) => {
+        const form = await triggerForm(req);
+        send_events_page({
+            res,
+            req,
+            active_sub: "Actions",
+            sub2_page: "New",
+            contents: {
+                type: "card",
+                title: req.__("New trigger"),
+                contents: renderForm(form, req.csrfToken()),
+            },
+        });
+    })
+);
+/**
+ * Edit Trigger (get)
+ */
+router.get(
+    "/trigger/:id",
+    setTenant,
+    isAdmin,
+    error_catcher(async (req, res) => {
+        const {id} = req.params;
+        const trigger = await Trigger.findOne({id});
+
+        const form = await triggerForm(req, trigger);
+        form.values = trigger;
+        send_events_page({
+            res,
+            req,
+            active_sub: "Actions",
+            sub2_page: "Edit",
+            contents: {
+                type: "card",
+                title: req.__("Edit trigger %s", id),
+                contents: renderForm(form, req.csrfToken()),
+            },
+        });
+    })
+);
+/**
+ * POST for new trigger
+ */
+router.post(
+    "/trigger",
+    setTenant,
+    isAdmin,
+    error_catcher(async (req, res) => {
+        const form = await triggerForm(req);
+
+        form.validate(req.body);
+        if (form.hasErrors) {
+            send_events_page({
+                res,
+                req,
+                active_sub: "Actions",
+                sub2_page: "Edit",
+                contents: {
+                    type: "card",
+                    title: req.__("Edit trigger"),
+                    contents: renderForm(form, req.csrfToken()),
+                },
+            });
+        } else {
+            let id;
+            if (form.values.id) {
+                id = form.values.id;
+                await Trigger.update(id, form.values);
+            } else {
+                const tr = await Trigger.create(form.values);
+                id = tr.id;
+            }
+            res.redirect(`/actions/configure/${id}`);
+        }
+    })
+);
+/**
+ * POST for existing trigger
+ */
+router.post(
+    "/trigger/:id",
+    setTenant,
+    isAdmin,
+    error_catcher(async (req, res) => {
+
+        const {id} = req.params;
+        const trigger = await Trigger.findOne({id});
+        // todo check that trigger exists
+
+        const form = await triggerForm(req, trigger);
+
+        form.validate(req.body);
+        if (form.hasErrors) {
+            send_events_page({
+                res,
+                req,
+                active_sub: "Actions",
+                sub2_page: "Edit",
+                contents: {
+                    type: "card",
+                    title: req.__("Edit trigger"),
+                    contents: renderForm(form, req.csrfToken()),
+                },
+            });
+        } else {
+            await Trigger.update(trigger.id, form.values); //{configuration: form.values});
+            req.flash("success", "Action information saved");
+            res.redirect(`/actions/`);
+        }
+    })
+);
+/**
+ * Edit Trigger configuration (GET)
+ *
+ * /actions/configure/:id
+ *
+ * - get configuration fields
+ * - create form
+ */
+router.get(
+    "/configure/:id",
+    setTenant,
+    isAdmin,
+    error_catcher(async (req, res) => {
+        const {id} = req.params;
+        const trigger = await Trigger.findOne({id});
+        const action = getState().actions[trigger.action];
+        if (!action) {
+            req.flash("warning", req.__("Action not found"));
+            res.redirect(`/actions/`);
+        } else if (!action.configFields) {
+            req.flash("warning", req.__("Action not configurable"));
+            res.redirect(`/actions/`);
+        } else {
+            // get table related to trigger
+            const table = trigger.table_id
+                ? await Table.findOne({id: trigger.table_id})
+                : null;
+            // get configuration fields
+            const cfgFields = await getActionConfigFields(action, table);
+            // create form
+            const form = new Form({
+                action: `/actions/configure/${id}`,
+                fields: cfgFields,
+            });
+            // populate form values
+            form.values = trigger.configuration;
+            // send events page
+            send_events_page({
+                res,
+                req,
+                active_sub: "Actions",
+                sub2_page: "Configure",
+                contents:
+                    {
+                        type: "card",
+                        title: req.__("Configure trigger"),
+                        contents: renderForm(form, req.csrfToken()),
+                    },
+            });
+        }
+    })
+);
+/**
+ * Configure Trigger (POST)
+ */
+router.post(
+    "/configure/:id",
+    setTenant,
+    isAdmin,
+    error_catcher(async (req, res) => {
+        const {id} = req.params;
+        const trigger = await Trigger.findOne({id});
+        const action = getState().actions[trigger.action];
+        const table = trigger.table_id
+            ? await Table.findOne({id: trigger.table_id})
+            : null;
+        const cfgFields = await getActionConfigFields(action, table);
+        const form = new Form({
+            action: `/actions/configure/${id}`,
+            fields: cfgFields,
+        });
+        form.validate(req.body);
+        if (form.hasErrors) {
+            send_events_page({
+                res,
+                req,
+                active_sub: "Actions",
+                sub2_page: "Configure",
+                contents: {
+                    type: "card",
+                    title: req.__("Configure trigger"),
+                    contents: renderForm(form, req.csrfToken()),
+                },
+            });
+        } else {
+            await Trigger.update(trigger.id, {configuration: form.values});
+            req.flash("success", "Action configuration saved");
+            res.redirect(`/actions/`);
+        }
+    })
+);
+router.post(
+    "/delete/:id",
+    setTenant,
+    isAdmin,
+    error_catcher(async (req, res) => {
+        const {id} = req.params;
+        const trigger = await Trigger.findOne({id});
+        await trigger.delete();
+        res.redirect(`/actions/`);
+    })
+);
+router.get(
+    "/testrun/:id",
+    setTenant,
+    isAdmin,
+    error_catcher(async (req, res) => {
+        const {id} = req.params;
+        const trigger = await Trigger.findOne({id});
+        const output = [];
+        const fakeConsole = {
+            log(...s) {
+                output.push(div(code(s.join(" "))));
+            },
+            error(...s) {
+                output.push(
+                    div(code({style: "color:red;font-weight:bold;"}, s.join(" ")))
+                );
+            },
+        };
+        let table, row;
+        if (trigger.table_id) {
+            table = await Table.findOne(trigger.table_id);
+            row = await table.getRow({});
+        }
+        try {
+            await trigger.runWithoutRow({
+                console: fakeConsole,
+                table,
+                row,
+                ...(row || {}),
+                Table,
+                user: req.user,
+            });
+        } catch (e) {
+            fakeConsole.error(e.message);
+        }
+        if (output.length === 0) {
+            req.flash(
+                "success",
+                req.__(
+                    "Action %s run successfully with no console output",
+                    trigger.action
+                )
+            );
+            res.redirect(`/actions/`);
+        } else {
+            send_events_page({
+                res,
+                req,
+                active_sub: "Actions",
+                sub2_page: "Test run output",
+                contents: {
+                    type: "card",
+                    title: req.__("Test run output"),
+                    contents: div(
+                        div({class: "testrunoutput"}, output),
+
+                        a(
+                            {href: `/actions`, class: "mt-4 btn btn-primary"},
+                            "&amp;laquo;&amp;nbsp;" + req.__("back to actions")
+                        )
+                    ),
+                },
+            });
+        }
+    })
+);
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Classes</h3><ul><li><a href="Field.html">Field</a></li><li><a href="File.html">File</a></li><li><a href="Page.html">Page</a></li><li><a href="Plugin.html">Plugin</a></li><li><a href="PluginsCommand.html">PluginsCommand</a></li><li><a href="State.html">State</a></li><li><a href="Table.html">Table</a></li><li><a href="Trigger.html">Trigger</a></li><li><a href="User.html">User</a></li><li><a href="global.html#View">View</a></li></ul><h3>Global</h3><ul><li><a href="global.html#add_unique_constraint">add_unique_constraint</a></li><li><a href="global.html#addOrCreateList">addOrCreateList</a></li><li><a href="global.html#bool">bool</a></li><li><a href="global.html#calcfldViewConfig">calcfldViewConfig</a></li><li><a href="global.html#calcfldViewOptions">calcfldViewOptions</a></li><li><a href="global.html#changeConnection">changeConnection</a></li><li><a href="global.html#check_email_mask">check_email_mask</a></li><li><a href="global.html#close">close</a></li><li><a href="global.html#color">color</a></li><li><a href="global.html#configFileDir">configFileDir</a></li><li><a href="global.html#configFilePath">configFilePath</a></li><li><a href="global.html#configTypes">configTypes</a></li><li><a href="global.html#constraintForm">constraintForm</a></li><li><a href="global.html#copyFrom">copyFrom</a></li><li><a href="global.html#copyFrom1">copyFrom1</a></li><li><a href="global.html#count">count</a></li><li><a href="global.html#create_blank_migration">create_blank_migration</a></li><li><a href="global.html#create_tenant">create_tenant</a></li><li><a href="global.html#create_tenant_allowed">create_tenant_allowed</a></li><li><a href="global.html#createTenant">createTenant</a></li><li><a href="global.html#date">date</a></li><li><a href="global.html#db">db</a></li><li><a href="global.html#defaultDataPath">defaultDataPath</a></li><li><a href="global.html#deleteConfig">deleteConfig</a></li><li><a href="global.html#deleteTenant">deleteTenant</a></li><li><a href="global.html#deleteWhere">deleteWhere</a></li><li><a href="global.html#discover_tables">discover_tables</a></li><li><a href="global.html#discoverable_tables">discoverable_tables</a></li><li><a href="global.html#discoverForm">discoverForm</a></li><li><a href="global.html#domain_sanitize">domain_sanitize</a></li><li><a href="global.html#drop_reset_schema">drop_reset_schema</a></li><li><a href="global.html#drop_unique_constraint">drop_unique_constraint</a></li><li><a href="global.html#eachTenant">eachTenant</a></li><li><a href="global.html#email_form">email_form</a></li><li><a href="global.html#ensure_final_slash">ensure_final_slash</a></li><li><a href="global.html#express">express</a></li><li><a href="global.html#fetch">fetch</a></li><li><a href="global.html#field_picker_fields">field_picker_fields</a></li><li><a href="global.html#findType">findType</a></li><li><a href="global.html#float">float</a></li><li><a href="global.html#fs">fs</a></li><li><a href="global.html#get_base_url">get_base_url</a></li><li><a href="global.html#get_child_views">get_child_views</a></li><li><a href="global.html#get_db_filepath">get_db_filepath</a></li><li><a href="global.html#get_domain">get_domain</a></li><li><a href="global.html#get_existing_views">get_existing_views</a></li><li><a href="global.html#get_latest_npm_version">get_latest_npm_version</a></li><li><a href="global.html#get_link_view_opts">get_link_view_opts</a></li><li><a href="global.html#get_other_domain_tenant">get_other_domain_tenant</a></li><li><a href="global.html#get_parent_views">get_parent_views</a></li><li><a href="global.html#get_process_init_time">get_process_init_time</a></li><li><a href="global.html#get_sql_logging">get_sql_logging</a></li><li><a href="global.html#get_tenant_info">get_tenant_info</a></li><li><a href="global.html#getActionConfigFields">getActionConfigFields</a></li><li><a href="global.html#getAllConfig">getAllConfig</a></li><li><a href="global.html#getAllConfigOrDefaults">getAllConfigOrDefaults</a></li><li><a href="global.html#getAllTenants">getAllTenants</a></li><li><a href="global.html#getClient">getClient</a></li><li><a href="global.html#getConfig">getConfig</a></li><li><a href="global.html#getConfigFile">getConfigFile</a></li><li><a href="global.html#getConnectObject">getConnectObject</a></li><li><a href="global.html#getGitRevision">getGitRevision</a></li><li><a href="global.html#getNewURL">getNewURL</a></li><li><a href="global.html#getRootPageForm">getRootPageForm</a></li><li><a href="global.html#getTenant">getTenant</a></li><li><a href="global.html#getVersion">getVersion</a></li><li><a href="global.html#implement_discovery">implement_discovery</a></li><li><a href="global.html#init_multi_tenant">init_multi_tenant</a></li><li><a href="global.html#initial_config_all_fields">initial_config_all_fields</a></li><li><a href="global.html#insert">insert</a></li><li><a href="global.html#int">int</a></li><li><a href="global.html#is_ip_address">is_ip_address</a></li><li><a href="global.html#is_sqlite">is_sqlite</a></li><li><a href="global.html#isDate">isDate</a></li><li><a href="global.html#isFixedConfig">isFixedConfig</a></li><li><a href="global.html#jsgrid_controller">jsgrid_controller</a></li><li><a href="global.html#json_list_to_external_table">json_list_to_external_table</a></li><li><a href="global.html#link_view">link_view</a></li><li><a href="global.html#migrate">migrate</a></li><li><a href="global.html#moment">moment</a></li><li><a href="global.html#normalise_error_message">normalise_error_message</a></li><li><a href="global.html#path">path</a></li><li><a href="global.html#picked_fields_to_query">picked_fields_to_query</a></li><li><a href="global.html#post_delete_btn">post_delete_btn</a></li><li><a href="global.html#readState">readState</a></li><li><a href="global.html#readStateStrict">readStateStrict</a></li><li><a href="global.html#recalculate_for_stored">recalculate_for_stored</a></li><li><a href="global.html#remove_from_menu">remove_from_menu</a></li><li><a href="global.html#renameForm">renameForm</a></li><li><a href="global.html#reprAsJson">reprAsJson</a></li><li><a href="global.html#reset_sequence">reset_sequence</a></li><li><a href="global.html#restart_tenant">restart_tenant</a></li><li><a href="global.html#Router">Router</a></li><li><a href="global.html#run_action_column">run_action_column</a></li><li><a href="global.html#runScheduler">runScheduler</a></li><li><a href="global.html#select">select</a></li><li><a href="global.html#selectMaybeOne">selectMaybeOne</a></li><li><a href="global.html#selectOne">selectOne</a></li><li><a href="global.html#set_multitenancy_cfg">set_multitenancy_cfg</a></li><li><a href="global.html#set_sql_logging">set_sql_logging</a></li><li><a href="global.html#set_tenant_base_url">set_tenant_base_url</a></li><li><a href="global.html#setConfig">setConfig</a></li><li><a href="global.html#setEmailForm">setEmailForm</a></li><li><a href="global.html#sql_log">sql_log</a></li><li><a href="global.html#sqlsanitize">sqlsanitize</a></li><li><a href="global.html#sqlsanitizeAllowDots">sqlsanitizeAllowDots</a></li><li><a href="global.html#stateFieldsToQuery">stateFieldsToQuery</a></li><li><a href="global.html#stateFieldsToWhere">stateFieldsToWhere</a></li><li><a href="global.html#strictParseInt">strictParseInt</a></li><li><a href="global.html#string">string</a></li><li><a href="global.html#table">table</a></li><li><a href="global.html#tableBadges">tableBadges</a></li><li><a href="global.html#tableForm">tableForm</a></li><li><a href="global.html#tenant_form">tenant_form</a></li><li><a href="global.html#transposeObjects">transposeObjects</a></li><li><a href="global.html#triggerForm">triggerForm</a></li><li><a href="global.html#typeToJsGridType">typeToJsGridType</a></li><li><a href="global.html#update">update</a></li><li><a href="global.html#user_dropdown">user_dropdown</a></li><li><a href="global.html#versionsField">versionsField</a></li><li><a href="global.html#whereFTS">whereFTS</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.7</a> on Sat Jun 19 2021 10:29:18 GMT+0100 (British Summer Time)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

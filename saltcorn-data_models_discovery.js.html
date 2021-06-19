@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: saltcorn-data/models/discovery.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: saltcorn-data/models/discovery.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>/**
+ * DB Tables discovery to Saltcorn tables.
+ * @type {{changeConnection?: ((function(*): Promise&lt;void>)|(function(*=): Promise&lt;void>)), select?: ((function(*=, *=, *=): Promise&lt;*>)|(function(*=, *=, *=): Promise&lt;*>)), runWithTenant: ((function(*=, *=): (*))|(function(*, *): *)), set_sql_logging?: (function(*=): void), insert?: ((function(*=, *=, *=): Promise&lt;undefined|*>)|(function(*=, *=, *=): Promise&lt;undefined|*>)), update?: ((function(*=, *=, *=): Promise&lt;void>)|(function(*=, *=, *=, *=): Promise&lt;void>)), sql_log?: (function(*=, *=): void), deleteWhere?: ((function(*=, *=): Promise&lt;void>)|(function(*=, *=): Promise&lt;*>)), isSQLite: *, selectMaybeOne?: ((function(*=, *=): Promise&lt;null|*>)|(function(*=, *=): Promise&lt;null|*>)), close?: (function(): Promise&lt;void>), drop_unique_constraint?: (function(*=, *): Promise&lt;void>), enable_multi_tenant: (function()), getVersion?: ((function(): Promise&lt;*>)|(function(*=): Promise&lt;*>)), add_unique_constraint?: (function(*=, *): Promise&lt;void>), getTenantSchema: ((function(): *)|(function(): *)), is_it_multi_tenant: ((function(): boolean)|(function(): boolean)), sqliteDatabase?: *, drop_reset_schema?: ((function(): Promise&lt;void>)|(function(*): Promise&lt;void>)), query?: ((function(*=, *=): Promise&lt;unknown>)|(function(*=, *=): *)), count?: ((function(*=, *=): Promise&lt;number>)|(function(*=, *=): Promise&lt;number>)), pool?: *, connectObj: {sc_version: *, connectionString: string | undefined, git_commit: *, version_tag: *}|{sc_version: *, git_commit: *, version_tag: *}|boolean, sqlsanitize: *|(function(...[*]=): *), getClient?: (function(): Promise&lt;*>), reset_sequence?: (function(*=): Promise&lt;void>), copyFrom?: (function(*=, *=, *, *): Promise&lt;void>), mkWhere: function(*=): {values: *, where: string|string}, selectOne?: ((function(*=, *=): Promise&lt;*|undefined>)|(function(*=, *=): Promise&lt;*|undefined>)), getTenantSchemaPrefix: function(): string|string}|{sqlsanitize?: *|(function(...[*]=): *), connectObj?: {sc_version: *, connectionString: string | undefined, git_commit: *, version_tag: *}|{sc_version: *, git_commit: *, version_tag: *}|boolean, isSQLite?: *, mkWhere?: function(*=): {values: *, where: string|string}, getTenantSchemaPrefix?: function(): string|string}}
+ */
+const db = require("../db");
+const { getState } = require("../db/state");
+const { available_languages } = require("./config");
+const Table = require("./table");
+
+// create table discmetable(id serial primary key, name text, age integer not null); ALTER TABLE discmetable OWNER TO tomn;
+/**
+ * List of discoverable tables.
+ * Returns all tables that can be imported to Saltcorn from current tenant database schema.
+ * The tables with name started with "_sc_" and tables imported to Saltcorn are ignored.
+ * @param schema0 - current tenant db schema
+ * @returns {Promise&lt;*>} all tables that can be imported to Saltcorn from current tenant database schema
+ */
+const discoverable_tables = async (schema0) => {
+  const schema = schema0 || db.getTenantSchema();
+  const {
+    rows,
+  } = await db.query(
+    "select * from information_schema.tables where table_schema=$1 order by table_name",
+    [schema]
+  );
+  const myTables = await Table.find({});
+  const myTableNames = myTables.map((t) => t.name);
+  const discoverable = rows.filter(
+    (t) =>
+      !(myTableNames.includes(t.table_name) || t.table_name.startsWith("_sc_"))
+  );
+  return discoverable;
+};
+/**
+ * List all views in current  tenant db schema
+ * @param schema0 - current tenant db schema
+ * @returns {Promise&lt;*>} Return list of views
+ */
+const get_existing_views = async (schema0) => {
+  const schema = schema0 || db.getTenantSchema();
+  const {
+    rows,
+  } = await db.query(
+    "select * from information_schema.views where table_schema=$1",
+    [schema]
+  );
+  return rows;
+};
+/**
+ * Mapping SQL Type to Saltcorn type
+ * @param sql_name - SQL type name
+ * @returns {string|*} return Saltcorn type
+ */
+const findType = (sql_name) => {
+  const fixed = {
+    integer: "Integer",
+    smallint: "Integer",
+    bigint: "Integer",
+    numeric: "Float", // required pres
+    character: "String", // char - if length is not defined is 1 else length needs to be defined
+    "character varying": "String", // varchar  - this type can have length
+    //varchar: "String",
+    date: "Date"
+    // TBD Implement time type in Saltcorn
+    // "time without time zone": "Date",
+    // TBD Implement timestamp type in Saltcorn
+    // "timestamp without time zone": "Date",
+    // TBD Implement time interval in Saltcorn
+    // interval: "Date"
+  }[sql_name];
+  if (fixed) return fixed;
+  const t = Object.entries(getState().types).find(
+    ([k, v]) => v.sql_name === sql_name
+  );
+  if (t) {
+    return t[0];
+  }
+};
+/**
+ * Discover tables definitions
+ * @param tableNames - list of table names
+ * @param schema0 - db schema
+ * @returns {Promise&lt;{tables: *[]}>}
+ */
+const discover_tables = async (tableNames, schema0) => {
+  const schema = schema0 || db.getTenantSchema();
+  const packTables = [];
+
+  for (const tnm of tableNames) {
+    const {
+      rows,
+    } = await db.query(
+      "select * from information_schema.columns where table_schema=$1 and table_name=$2",
+      [schema, tnm]
+    );
+    // TBD add logic about column length, scale, etc
+    const fields = rows
+      .map((c) => ({
+        name: c.column_name,
+        label: c.column_name,
+        type: findType(c.data_type),
+        required: c.is_nullable === "NO",
+      }))
+      .filter((f) => f.type);
+
+    // try to find column name for primary key of table
+    const pkq = await db.query(
+      `SELECT c.column_name
+      FROM information_schema.table_constraints tc 
+      JOIN information_schema.constraint_column_usage AS ccu USING (constraint_schema, constraint_name) 
+      JOIN information_schema.columns AS c ON c.table_schema = tc.constraint_schema
+        AND tc.table_name = c.table_name AND ccu.column_name = c.column_name
+      WHERE constraint_type = 'PRIMARY KEY' and tc.table_schema=$1 and tc.table_name = $2;`,
+      [schema, tnm]
+    );
+    // set primary_key and unique attributes for column
+    pkq.rows.forEach(({ column_name }) => {
+      const field = fields.find((f) => f.name === column_name);
+      field.primary_key = true;
+      field.is_unique = true;
+    });
+    // try to find foreign keys
+    const fkq = await db.query(
+      `SELECT
+      tc.table_schema, 
+      tc.constraint_name, 
+      tc.table_name, 
+      kcu.column_name, 
+      ccu.table_schema AS foreign_table_schema,
+      ccu.table_name AS foreign_table_name,
+      ccu.column_name AS foreign_column_name 
+  FROM 
+      information_schema.table_constraints AS tc 
+      JOIN information_schema.key_column_usage AS kcu
+        ON tc.constraint_name = kcu.constraint_name
+        AND tc.table_schema = kcu.table_schema
+      JOIN information_schema.constraint_column_usage AS ccu
+        ON ccu.constraint_name = tc.constraint_name
+        AND ccu.table_schema = tc.table_schema
+  WHERE tc.constraint_type = 'FOREIGN KEY' and tc.table_schema=$1 AND tc.table_name=$2;`,
+      [schema, tnm]
+    );
+    // construct foreign key relations
+    fkq.rows.forEach(
+      ({ column_name, foreign_table_name, foreign_column_name }) => {
+        const field = fields.find((f) => f.name === column_name);
+        field.type = "Key";
+        field.reftable_name = foreign_table_name;
+        field.refname = foreign_column_name;
+      }
+    );
+
+    packTables.push({ name: tnm, fields, min_role_read: 1, min_role_write: 1 });
+  }
+  packTables.forEach((t) => {
+    t.fields.forEach((f) => {
+      if (f.type === "Key") {
+        const reftable = packTables.find(
+          (reft) => reft.name === f.reftable_name
+        );
+        const refpk = reftable.fields.find((rtf) => rtf.primary_key);
+        f.reftype = refpk.type;
+      }
+    });
+  });
+  return { tables: packTables };
+};
+/**
+ * Add discovered tables to Saltcorn
+ * @param pack - table definition
+ * @returns {Promise&lt;void>}
+ */
+const implement_discovery = async (pack) => {
+  for (const table of pack.tables) {
+    const { fields, ...tblRow } = table;
+    const id = await db.insert("_sc_tables", tblRow);
+    table.id = id;
+  }
+  for (const table of pack.tables) {
+    for (const field of table.fields) {
+      await db.insert("_sc_fields", { ...field, table_id: table.id });
+    }
+  }
+  // refresh Saltcorn table list (in memory)
+  await require("../db/state").getState().refresh_tables();
+
+};
+module.exports = {
+  discoverable_tables,
+  discover_tables,
+  implement_discovery,
+  get_existing_views,
+};
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Classes</h3><ul><li><a href="Field.html">Field</a></li><li><a href="File.html">File</a></li><li><a href="Page.html">Page</a></li><li><a href="Plugin.html">Plugin</a></li><li><a href="PluginsCommand.html">PluginsCommand</a></li><li><a href="State.html">State</a></li><li><a href="Table.html">Table</a></li><li><a href="Trigger.html">Trigger</a></li><li><a href="User.html">User</a></li><li><a href="global.html#View">View</a></li></ul><h3>Global</h3><ul><li><a href="global.html#add_unique_constraint">add_unique_constraint</a></li><li><a href="global.html#addOrCreateList">addOrCreateList</a></li><li><a href="global.html#bool">bool</a></li><li><a href="global.html#calcfldViewConfig">calcfldViewConfig</a></li><li><a href="global.html#calcfldViewOptions">calcfldViewOptions</a></li><li><a href="global.html#changeConnection">changeConnection</a></li><li><a href="global.html#check_email_mask">check_email_mask</a></li><li><a href="global.html#close">close</a></li><li><a href="global.html#color">color</a></li><li><a href="global.html#configFileDir">configFileDir</a></li><li><a href="global.html#configFilePath">configFilePath</a></li><li><a href="global.html#configTypes">configTypes</a></li><li><a href="global.html#constraintForm">constraintForm</a></li><li><a href="global.html#copyFrom">copyFrom</a></li><li><a href="global.html#copyFrom1">copyFrom1</a></li><li><a href="global.html#count">count</a></li><li><a href="global.html#create_blank_migration">create_blank_migration</a></li><li><a href="global.html#create_tenant">create_tenant</a></li><li><a href="global.html#create_tenant_allowed">create_tenant_allowed</a></li><li><a href="global.html#createTenant">createTenant</a></li><li><a href="global.html#date">date</a></li><li><a href="global.html#db">db</a></li><li><a href="global.html#defaultDataPath">defaultDataPath</a></li><li><a href="global.html#deleteConfig">deleteConfig</a></li><li><a href="global.html#deleteTenant">deleteTenant</a></li><li><a href="global.html#deleteWhere">deleteWhere</a></li><li><a href="global.html#discover_tables">discover_tables</a></li><li><a href="global.html#discoverable_tables">discoverable_tables</a></li><li><a href="global.html#discoverForm">discoverForm</a></li><li><a href="global.html#domain_sanitize">domain_sanitize</a></li><li><a href="global.html#drop_reset_schema">drop_reset_schema</a></li><li><a href="global.html#drop_unique_constraint">drop_unique_constraint</a></li><li><a href="global.html#eachTenant">eachTenant</a></li><li><a href="global.html#email_form">email_form</a></li><li><a href="global.html#ensure_final_slash">ensure_final_slash</a></li><li><a href="global.html#express">express</a></li><li><a href="global.html#fetch">fetch</a></li><li><a href="global.html#field_picker_fields">field_picker_fields</a></li><li><a href="global.html#findType">findType</a></li><li><a href="global.html#float">float</a></li><li><a href="global.html#fs">fs</a></li><li><a href="global.html#get_base_url">get_base_url</a></li><li><a href="global.html#get_child_views">get_child_views</a></li><li><a href="global.html#get_db_filepath">get_db_filepath</a></li><li><a href="global.html#get_domain">get_domain</a></li><li><a href="global.html#get_existing_views">get_existing_views</a></li><li><a href="global.html#get_latest_npm_version">get_latest_npm_version</a></li><li><a href="global.html#get_link_view_opts">get_link_view_opts</a></li><li><a href="global.html#get_other_domain_tenant">get_other_domain_tenant</a></li><li><a href="global.html#get_parent_views">get_parent_views</a></li><li><a href="global.html#get_process_init_time">get_process_init_time</a></li><li><a href="global.html#get_sql_logging">get_sql_logging</a></li><li><a href="global.html#get_tenant_info">get_tenant_info</a></li><li><a href="global.html#getActionConfigFields">getActionConfigFields</a></li><li><a href="global.html#getAllConfig">getAllConfig</a></li><li><a href="global.html#getAllConfigOrDefaults">getAllConfigOrDefaults</a></li><li><a href="global.html#getAllTenants">getAllTenants</a></li><li><a href="global.html#getClient">getClient</a></li><li><a href="global.html#getConfig">getConfig</a></li><li><a href="global.html#getConfigFile">getConfigFile</a></li><li><a href="global.html#getConnectObject">getConnectObject</a></li><li><a href="global.html#getGitRevision">getGitRevision</a></li><li><a href="global.html#getNewURL">getNewURL</a></li><li><a href="global.html#getRootPageForm">getRootPageForm</a></li><li><a href="global.html#getTenant">getTenant</a></li><li><a href="global.html#getVersion">getVersion</a></li><li><a href="global.html#implement_discovery">implement_discovery</a></li><li><a href="global.html#init_multi_tenant">init_multi_tenant</a></li><li><a href="global.html#initial_config_all_fields">initial_config_all_fields</a></li><li><a href="global.html#insert">insert</a></li><li><a href="global.html#int">int</a></li><li><a href="global.html#is_ip_address">is_ip_address</a></li><li><a href="global.html#is_sqlite">is_sqlite</a></li><li><a href="global.html#isDate">isDate</a></li><li><a href="global.html#isFixedConfig">isFixedConfig</a></li><li><a href="global.html#jsgrid_controller">jsgrid_controller</a></li><li><a href="global.html#json_list_to_external_table">json_list_to_external_table</a></li><li><a href="global.html#link_view">link_view</a></li><li><a href="global.html#migrate">migrate</a></li><li><a href="global.html#moment">moment</a></li><li><a href="global.html#normalise_error_message">normalise_error_message</a></li><li><a href="global.html#path">path</a></li><li><a href="global.html#picked_fields_to_query">picked_fields_to_query</a></li><li><a href="global.html#post_delete_btn">post_delete_btn</a></li><li><a href="global.html#readState">readState</a></li><li><a href="global.html#readStateStrict">readStateStrict</a></li><li><a href="global.html#recalculate_for_stored">recalculate_for_stored</a></li><li><a href="global.html#remove_from_menu">remove_from_menu</a></li><li><a href="global.html#renameForm">renameForm</a></li><li><a href="global.html#reprAsJson">reprAsJson</a></li><li><a href="global.html#reset_sequence">reset_sequence</a></li><li><a href="global.html#restart_tenant">restart_tenant</a></li><li><a href="global.html#Router">Router</a></li><li><a href="global.html#run_action_column">run_action_column</a></li><li><a href="global.html#runScheduler">runScheduler</a></li><li><a href="global.html#select">select</a></li><li><a href="global.html#selectMaybeOne">selectMaybeOne</a></li><li><a href="global.html#selectOne">selectOne</a></li><li><a href="global.html#set_multitenancy_cfg">set_multitenancy_cfg</a></li><li><a href="global.html#set_sql_logging">set_sql_logging</a></li><li><a href="global.html#set_tenant_base_url">set_tenant_base_url</a></li><li><a href="global.html#setConfig">setConfig</a></li><li><a href="global.html#setEmailForm">setEmailForm</a></li><li><a href="global.html#sql_log">sql_log</a></li><li><a href="global.html#sqlsanitize">sqlsanitize</a></li><li><a href="global.html#sqlsanitizeAllowDots">sqlsanitizeAllowDots</a></li><li><a href="global.html#stateFieldsToQuery">stateFieldsToQuery</a></li><li><a href="global.html#stateFieldsToWhere">stateFieldsToWhere</a></li><li><a href="global.html#strictParseInt">strictParseInt</a></li><li><a href="global.html#string">string</a></li><li><a href="global.html#table">table</a></li><li><a href="global.html#tableBadges">tableBadges</a></li><li><a href="global.html#tableForm">tableForm</a></li><li><a href="global.html#tenant_form">tenant_form</a></li><li><a href="global.html#transposeObjects">transposeObjects</a></li><li><a href="global.html#triggerForm">triggerForm</a></li><li><a href="global.html#typeToJsGridType">typeToJsGridType</a></li><li><a href="global.html#update">update</a></li><li><a href="global.html#user_dropdown">user_dropdown</a></li><li><a href="global.html#versionsField">versionsField</a></li><li><a href="global.html#whereFTS">whereFTS</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.7</a> on Sat Jun 19 2021 10:29:18 GMT+0100 (British Summer Time)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

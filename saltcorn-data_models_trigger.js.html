@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: saltcorn-data/models/trigger.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: saltcorn-data/models/trigger.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>/**
+ *
+ * Trigger Data Access Layer
+ */
+
+const db = require("../db");
+const { contract, is } = require("contractis");
+const { satisfies } = require("../utils");
+
+/**
+ * Trigger class
+ */
+class Trigger {
+  constructor(o) {
+    this.name = o.name;
+    this.action = o.action;
+    this.description = o.description;
+    this.table_id = !o.table_id ? null : +o.table_id;
+    this.table_name = o.table_name;
+    if (o.table) {
+      this.table_id = o.table.id;
+      this.table_name = o.table.name;
+    }
+    this.when_trigger = o.when_trigger;
+    this.id = !o.id ? null : +o.id;
+    this.configuration =
+      typeof o.configuration === "string"
+        ? JSON.parse(o.configuration)
+        : o.configuration || {};
+
+    contract.class(this);
+  }
+
+  /**
+   * Get JSON from Trigger
+   * @returns {{when_trigger, configuration: any, name, description, action}}
+   */
+  get toJson() {
+    return {
+      name: this.name,
+      description: this.description, // todo not sure that is required
+      action: this.action,
+      when_trigger: this.when_trigger,
+      configuration: this.configuration,
+    };
+  }
+
+  /**
+   * Find triggers in State cache
+   * @param where - condition
+   * @returns {T[]}
+   */
+  static find(where) {
+    const { getState } = require("../db/state");
+    return getState().triggers.filter(satisfies(where));
+  }
+
+  /**
+   * Find triggers in DB
+   * @param where
+   * @param selectopts
+   * @returns {Promise&lt;*>}
+   */
+  static async findDB(where, selectopts) {
+    const db_flds = await db.select("_sc_triggers", where, selectopts);
+    return db_flds.map((dbf) => new Trigger(dbf));
+  }
+
+  /**
+   * Find all triggers
+   * @returns {Promise&lt;*>}
+   */
+  static async findAllWithTableName() {
+    const schema = db.getTenantSchemaPrefix();
+
+    const sql = `select a.id, a.name, a.action, t.name as table_name, a. when_trigger 
+    from ${schema}_sc_triggers a left join ${schema}_sc_tables t on t.id=table_id order by a.id`;
+    const { rows } = await db.query(sql);
+    return rows.map((dbf) => new Trigger(dbf));
+  }
+
+  /**
+   * Find one trigger in State cache
+   * @param where
+   * @returns {T}
+   */
+  static findOne(where) {
+    const { getState } = require("../db/state");
+    return getState().triggers.find(
+      where.id ? (v) => v.id === +where.id : satisfies(where)
+    );
+  }
+
+  /**
+   * Update trigger
+   * @param id
+   * @param row
+   * @returns {Promise&lt;void>}
+   */
+  static async update(id, row) {
+    await db.update("_sc_triggers", row, id);
+    await require("../db/state").getState().refresh_triggers();
+  }
+
+  /**
+   * Create trigger
+   * @param f
+   * @returns {Promise&lt;Trigger>}
+   */
+  static async create(f) {
+    const trigger = new Trigger(f);
+    const { id, table_name, ...rest } = trigger;
+    const fid = await db.insert("_sc_triggers", rest);
+    trigger.id = fid;
+    await require("../db/state").getState().refresh_triggers();
+    return trigger;
+  }
+
+  /**
+   * Delete current trigger
+   * @returns {Promise&lt;void>}
+   */
+  async delete() {
+    await db.deleteWhere("_sc_triggers", { id: this.id });
+    await require("../db/state").getState().refresh_triggers();
+  }
+
+  /**
+   * Run table triggers
+   * @param when_trigger
+   * @param table
+   * @param row
+   * @returns {Promise&lt;void>}
+   */
+  static async runTableTriggers(when_trigger, table, row) {
+    const triggers = await Trigger.getTableTriggers(when_trigger, table);
+    for (const trigger of triggers) {
+      await trigger.run(row);
+    }
+  }
+
+  /**
+   * Run trigger without row
+   * @param runargs
+   * @returns {Promise&lt;*>}
+   */
+  async runWithoutRow(runargs = {}) {
+    const { getState } = require("../db/state");
+    const action = getState().actions[this.action];
+    return (
+      action &amp;&amp;
+      action.run &amp;&amp;
+      action.run({
+        ...runargs,
+        configuration: this.configuration,
+      })
+    );
+  }
+
+  /**
+   * get triggers
+   * @param when_trigger
+   * @param table
+   * @returns {Promise&lt;*>}
+   */
+  static async getTableTriggers(when_trigger, table) {
+    const { getState } = require("../db/state");
+
+    const triggers = await Trigger.find({ when_trigger, table_id: table.id });
+    for (const trigger of triggers) {
+      const action = getState().actions[trigger.action];
+      trigger.run = (row) =>
+        action &amp;&amp;
+        action.run &amp;&amp;
+        action.run({
+          table,
+          configuration: trigger.configuration,
+          row,
+          ...row,
+        });
+    }
+    return triggers;
+  }
+
+  /**
+   *  Trigger when options
+   * @returns {string[]}
+   */
+  static get when_options() {
+    return [
+      "Insert",
+      "Update",
+      "Delete",
+      "Weekly",
+      "Daily",
+      "Hourly",
+      "Often",
+      "API call",
+      "Never",
+    ];
+  }
+}
+// todo clone trigger
+/**
+ * Trigger contract
+ * @type {{variables: {when_trigger: ((function(*=): *)|*), configuration: ((function(*=): *)|*), name: ((function(*=): *)|*), action: ((function(*=): *)|*), id: ((function(*=): *)|*), table_id: ((function(*=): *)|*)}, methods: {delete: ((function(*=): *)|*)}, static_methods: {find: ((function(*=): *)|*), findOne: ((function(*=): *)|*), create: ((function(*=): *)|*), update: ((function(*=): *)|*), getTableTriggers: ((function(*=): *)|*), runTableTriggers: ((function(*=): *)|*)}}}
+ */
+Trigger.contract = {
+  variables: {
+    action: is.str,
+    table_id: is.maybe(is.posint),
+    name: is.maybe(is.str),
+    when_trigger: is.one_of(Trigger.when_options),
+    id: is.maybe(is.posint),
+    configuration: is.obj(),
+  },
+  methods: {
+    delete: is.fun([], is.promise(is.undefined)),
+  },
+  static_methods: {
+    find: is.fun(
+      [is.maybe(is.obj()), is.maybe(is.obj())],
+      is.array(is.class("Trigger"))
+    ),
+    create: is.fun(is.obj(), is.promise(is.class("Trigger"))),
+    findOne: is.fun(is.obj(), is.maybe(is.class("Trigger"))),
+    update: is.fun([is.posint, is.obj()], is.promise(is.undefined)),
+    runTableTriggers: is.fun(
+      [is.one_of(Trigger.when_options), is.class("Table"), is.obj({})],
+      is.promise(is.undefined)
+    ),
+    getTableTriggers: is.fun(
+      [is.one_of(Trigger.when_options), is.class("Table")],
+      is.promise(
+        is.array(is.obj({ action: is.str, run: is.fun(is.obj({}), is.any) }))
+      )
+    ),
+  },
+};
+
+module.exports = Trigger;
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Classes</h3><ul><li><a href="Field.html">Field</a></li><li><a href="File.html">File</a></li><li><a href="Page.html">Page</a></li><li><a href="Plugin.html">Plugin</a></li><li><a href="PluginsCommand.html">PluginsCommand</a></li><li><a href="State.html">State</a></li><li><a href="Table.html">Table</a></li><li><a href="Trigger.html">Trigger</a></li><li><a href="User.html">User</a></li><li><a href="global.html#View">View</a></li></ul><h3>Global</h3><ul><li><a href="global.html#add_unique_constraint">add_unique_constraint</a></li><li><a href="global.html#addOrCreateList">addOrCreateList</a></li><li><a href="global.html#bool">bool</a></li><li><a href="global.html#calcfldViewConfig">calcfldViewConfig</a></li><li><a href="global.html#calcfldViewOptions">calcfldViewOptions</a></li><li><a href="global.html#changeConnection">changeConnection</a></li><li><a href="global.html#check_email_mask">check_email_mask</a></li><li><a href="global.html#close">close</a></li><li><a href="global.html#color">color</a></li><li><a href="global.html#configFileDir">configFileDir</a></li><li><a href="global.html#configFilePath">configFilePath</a></li><li><a href="global.html#configTypes">configTypes</a></li><li><a href="global.html#constraintForm">constraintForm</a></li><li><a href="global.html#copyFrom">copyFrom</a></li><li><a href="global.html#copyFrom1">copyFrom1</a></li><li><a href="global.html#count">count</a></li><li><a href="global.html#create_blank_migration">create_blank_migration</a></li><li><a href="global.html#create_tenant">create_tenant</a></li><li><a href="global.html#create_tenant_allowed">create_tenant_allowed</a></li><li><a href="global.html#createTenant">createTenant</a></li><li><a href="global.html#date">date</a></li><li><a href="global.html#db">db</a></li><li><a href="global.html#defaultDataPath">defaultDataPath</a></li><li><a href="global.html#deleteConfig">deleteConfig</a></li><li><a href="global.html#deleteTenant">deleteTenant</a></li><li><a href="global.html#deleteWhere">deleteWhere</a></li><li><a href="global.html#discover_tables">discover_tables</a></li><li><a href="global.html#discoverable_tables">discoverable_tables</a></li><li><a href="global.html#discoverForm">discoverForm</a></li><li><a href="global.html#domain_sanitize">domain_sanitize</a></li><li><a href="global.html#drop_reset_schema">drop_reset_schema</a></li><li><a href="global.html#drop_unique_constraint">drop_unique_constraint</a></li><li><a href="global.html#eachTenant">eachTenant</a></li><li><a href="global.html#email_form">email_form</a></li><li><a href="global.html#ensure_final_slash">ensure_final_slash</a></li><li><a href="global.html#express">express</a></li><li><a href="global.html#fetch">fetch</a></li><li><a href="global.html#field_picker_fields">field_picker_fields</a></li><li><a href="global.html#findType">findType</a></li><li><a href="global.html#float">float</a></li><li><a href="global.html#fs">fs</a></li><li><a href="global.html#get_base_url">get_base_url</a></li><li><a href="global.html#get_child_views">get_child_views</a></li><li><a href="global.html#get_db_filepath">get_db_filepath</a></li><li><a href="global.html#get_domain">get_domain</a></li><li><a href="global.html#get_existing_views">get_existing_views</a></li><li><a href="global.html#get_latest_npm_version">get_latest_npm_version</a></li><li><a href="global.html#get_link_view_opts">get_link_view_opts</a></li><li><a href="global.html#get_other_domain_tenant">get_other_domain_tenant</a></li><li><a href="global.html#get_parent_views">get_parent_views</a></li><li><a href="global.html#get_process_init_time">get_process_init_time</a></li><li><a href="global.html#get_sql_logging">get_sql_logging</a></li><li><a href="global.html#get_tenant_info">get_tenant_info</a></li><li><a href="global.html#getActionConfigFields">getActionConfigFields</a></li><li><a href="global.html#getAllConfig">getAllConfig</a></li><li><a href="global.html#getAllConfigOrDefaults">getAllConfigOrDefaults</a></li><li><a href="global.html#getAllTenants">getAllTenants</a></li><li><a href="global.html#getClient">getClient</a></li><li><a href="global.html#getConfig">getConfig</a></li><li><a href="global.html#getConfigFile">getConfigFile</a></li><li><a href="global.html#getConnectObject">getConnectObject</a></li><li><a href="global.html#getGitRevision">getGitRevision</a></li><li><a href="global.html#getNewURL">getNewURL</a></li><li><a href="global.html#getRootPageForm">getRootPageForm</a></li><li><a href="global.html#getTenant">getTenant</a></li><li><a href="global.html#getVersion">getVersion</a></li><li><a href="global.html#implement_discovery">implement_discovery</a></li><li><a href="global.html#init_multi_tenant">init_multi_tenant</a></li><li><a href="global.html#initial_config_all_fields">initial_config_all_fields</a></li><li><a href="global.html#insert">insert</a></li><li><a href="global.html#int">int</a></li><li><a href="global.html#is_ip_address">is_ip_address</a></li><li><a href="global.html#is_sqlite">is_sqlite</a></li><li><a href="global.html#isDate">isDate</a></li><li><a href="global.html#isFixedConfig">isFixedConfig</a></li><li><a href="global.html#jsgrid_controller">jsgrid_controller</a></li><li><a href="global.html#json_list_to_external_table">json_list_to_external_table</a></li><li><a href="global.html#link_view">link_view</a></li><li><a href="global.html#migrate">migrate</a></li><li><a href="global.html#moment">moment</a></li><li><a href="global.html#normalise_error_message">normalise_error_message</a></li><li><a href="global.html#path">path</a></li><li><a href="global.html#picked_fields_to_query">picked_fields_to_query</a></li><li><a href="global.html#post_delete_btn">post_delete_btn</a></li><li><a href="global.html#readState">readState</a></li><li><a href="global.html#readStateStrict">readStateStrict</a></li><li><a href="global.html#recalculate_for_stored">recalculate_for_stored</a></li><li><a href="global.html#remove_from_menu">remove_from_menu</a></li><li><a href="global.html#renameForm">renameForm</a></li><li><a href="global.html#reprAsJson">reprAsJson</a></li><li><a href="global.html#reset_sequence">reset_sequence</a></li><li><a href="global.html#restart_tenant">restart_tenant</a></li><li><a href="global.html#Router">Router</a></li><li><a href="global.html#run_action_column">run_action_column</a></li><li><a href="global.html#runScheduler">runScheduler</a></li><li><a href="global.html#select">select</a></li><li><a href="global.html#selectMaybeOne">selectMaybeOne</a></li><li><a href="global.html#selectOne">selectOne</a></li><li><a href="global.html#set_multitenancy_cfg">set_multitenancy_cfg</a></li><li><a href="global.html#set_sql_logging">set_sql_logging</a></li><li><a href="global.html#set_tenant_base_url">set_tenant_base_url</a></li><li><a href="global.html#setConfig">setConfig</a></li><li><a href="global.html#setEmailForm">setEmailForm</a></li><li><a href="global.html#sql_log">sql_log</a></li><li><a href="global.html#sqlsanitize">sqlsanitize</a></li><li><a href="global.html#sqlsanitizeAllowDots">sqlsanitizeAllowDots</a></li><li><a href="global.html#stateFieldsToQuery">stateFieldsToQuery</a></li><li><a href="global.html#stateFieldsToWhere">stateFieldsToWhere</a></li><li><a href="global.html#strictParseInt">strictParseInt</a></li><li><a href="global.html#string">string</a></li><li><a href="global.html#table">table</a></li><li><a href="global.html#tableBadges">tableBadges</a></li><li><a href="global.html#tableForm">tableForm</a></li><li><a href="global.html#tenant_form">tenant_form</a></li><li><a href="global.html#transposeObjects">transposeObjects</a></li><li><a href="global.html#triggerForm">triggerForm</a></li><li><a href="global.html#typeToJsGridType">typeToJsGridType</a></li><li><a href="global.html#update">update</a></li><li><a href="global.html#user_dropdown">user_dropdown</a></li><li><a href="global.html#versionsField">versionsField</a></li><li><a href="global.html#whereFTS">whereFTS</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.7</a> on Sat Jun 19 2021 10:29:18 GMT+0100 (British Summer Time)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>
